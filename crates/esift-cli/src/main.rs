@@ -69,8 +69,7 @@ enum Commands {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("esift=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("esift=info".parse()?),
         )
         .init();
 
@@ -114,10 +113,12 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--dest-url required for openobserve"))?;
                     let stream = dest_stream
                         .ok_or_else(|| anyhow::anyhow!("--dest-stream required for openobserve"))?;
-                    let username = dest_username
-                        .ok_or_else(|| anyhow::anyhow!("--dest-username required for openobserve"))?;
-                    let password = dest_password
-                        .ok_or_else(|| anyhow::anyhow!("--dest-password required for openobserve"))?;
+                    let username = dest_username.ok_or_else(|| {
+                        anyhow::anyhow!("--dest-username required for openobserve")
+                    })?;
+                    let password = dest_password.ok_or_else(|| {
+                        anyhow::anyhow!("--dest-password required for openobserve")
+                    })?;
                     Box::new(OpenObserveDestination::new(
                         url, dest_org, stream, username, password,
                     )?)
@@ -131,8 +132,13 @@ async fn main() -> Result<()> {
             let transformer = Transformer::identity();
             let mut checkpoint_mgr = CheckpointManager::new(checkpoint)?;
 
-            run_extraction(&mut source, &mut *destination, &transformer, &mut checkpoint_mgr)
-                .await?;
+            run_extraction(
+                &mut source,
+                &mut *destination,
+                &transformer,
+                &mut checkpoint_mgr,
+            )
+            .await?;
         }
     }
 

@@ -1,7 +1,7 @@
 pub mod openobserve;
 pub mod stdout;
 
-use crate::{Document, error::Result};
+use crate::{error::Result, Document};
 use async_trait::async_trait;
 
 /// Anything esift can write documents to.

@@ -1,6 +1,6 @@
 pub mod opensearch;
 
-use crate::{Document, error::Result};
+use crate::{error::Result, Document};
 use async_trait::async_trait;
 
 /// Anything esift can read documents from.

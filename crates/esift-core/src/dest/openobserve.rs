@@ -11,8 +11,8 @@
 
 use super::Destination;
 use crate::{
-    Document,
     error::{EsiftError, Result},
+    Document,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -74,7 +74,8 @@ impl Destination for OpenObserveDestination {
 
         debug!("POSTing {} docs to {}", count, self.bulk_url());
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.bulk_url())
             .basic_auth(&self.username, Some(&self.password))
             .header("Content-Type", "application/x-ndjson")
