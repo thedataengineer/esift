@@ -1,0 +1,26 @@
+# Example esift configuration
+# Copy to esift.toml and fill in your values.
+
+[source]
+url = "http://localhost:9200"
+index = "nginx-logs-*"
+# username = "admin"
+# password = "changeme"
+batch_size = 500
+# Filter by time range:
+# query = '{"range": {"@timestamp": {"gte": "2025-01-01", "lte": "2025-06-01"}}}'
+query = '{"match_all": {}}'
+
+[destination]
+type = "openobserve"
+url = "http://localhost:5080"
+org = "default"
+stream = "migrated_logs"
+username = "root@example.com"
+password = "Complexpass#123"
+
+# To dump to stdout instead:
+# [destination]
+# type = "stdout"
+
+checkpoint_path = "./esift-checkpoint.json"
