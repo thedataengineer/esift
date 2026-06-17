@@ -20,6 +20,7 @@ struct Cli {
     command: Commands,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Run from a TOML config file
