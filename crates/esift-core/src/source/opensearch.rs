@@ -24,12 +24,12 @@
 
 use super::Source;
 use crate::{
-    Document,
     error::{EsiftError, Result},
+    Document,
 };
 use async_trait::async_trait;
-use reqwest::{Client, header};
-use serde_json::{Value, json};
+use reqwest::{header, Client};
+use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 pub struct OpenSearchSource {
@@ -68,9 +68,7 @@ impl OpenSearchSource {
             header::HeaderValue::from_static("application/json"),
         );
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .build()?;
+        let client = Client::builder().default_headers(headers).build()?;
 
         Ok(Self {
             client,
@@ -124,7 +122,10 @@ impl Source for OpenSearchSource {
 
         // Fall back to Elasticsearch path: POST /{index}/_pit?keep_alive=5m
         if status.as_u16() == 404 || status.as_u16() == 405 {
-            warn!("OpenSearch PIT path returned {}, trying Elasticsearch path", status);
+            warn!(
+                "OpenSearch PIT path returned {}, trying Elasticsearch path",
+                status
+            );
             let es_url = format!("{}/{}/_pit?keep_alive=5m", self.base_url, self.index);
             let resp = self.maybe_auth(self.client.post(&es_url)).send().await?;
 
@@ -160,9 +161,10 @@ impl Source for OpenSearchSource {
             return Ok(None);
         }
 
-        let pit_id = self.pit_id.as_ref().ok_or_else(|| {
-            EsiftError::Source("Call open() before next_batch()".into())
-        })?;
+        let pit_id = self
+            .pit_id
+            .as_ref()
+            .ok_or_else(|| EsiftError::Source("Call open() before next_batch()".into()))?;
 
         // Sort by _id ascending.
         // _shard_doc is NOT supported in OpenSearch (confirmed broken through 2.17).
@@ -183,7 +185,10 @@ impl Source for OpenSearchSource {
         }
 
         let url = format!("{}/_search", self.base_url);
-        let resp = self.maybe_auth(self.client.post(&url).json(&body)).send().await?;
+        let resp = self
+            .maybe_auth(self.client.post(&url).json(&body))
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -242,7 +247,9 @@ impl Source for OpenSearchSource {
                 ApiFlavor::OpenSearch | ApiFlavor::Unknown => {
                     let url = format!("{}/_search/point_in_time", self.base_url);
                     let req = self.maybe_auth(
-                        self.client.delete(&url).json(&json!({ "pit_id": [pit_id] })),
+                        self.client
+                            .delete(&url)
+                            .json(&json!({ "pit_id": [pit_id] })),
                     );
                     if let Err(e) = req.send().await {
                         warn!("PIT close failed (non-fatal): {}", e);
@@ -250,9 +257,8 @@ impl Source for OpenSearchSource {
                 }
                 ApiFlavor::Elasticsearch => {
                     let url = format!("{}/_pit", self.base_url);
-                    let req = self.maybe_auth(
-                        self.client.delete(&url).json(&json!({ "id": pit_id })),
-                    );
+                    let req =
+                        self.maybe_auth(self.client.delete(&url).json(&json!({ "id": pit_id })));
                     if let Err(e) = req.send().await {
                         warn!("PIT close failed (non-fatal): {}", e);
                     }
