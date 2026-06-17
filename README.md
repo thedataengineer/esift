@@ -1,8 +1,8 @@
-# esift
-
-[![Build](https://img.shields.io/github/actions/workflow/status/thekarteek/esift/ci.yml?branch=main)](https://github.com/thekarteek/esift/actions)
+[![Build](https://img.shields.io/github/actions/workflow/status/thedataengineer/esift/ci.yml?branch=main)](https://github.com/thedataengineer/esift/actions)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+
+# esift
 
 Extract data from Elasticsearch-compatible sources and re-ingest it anywhere.
 
@@ -15,7 +15,7 @@ Most observability platforms assume logs are short-lived. esift is for the cases
 ### From source
 
 ```bash
-git clone https://github.com/thekarteek/esift
+git clone https://github.com/thedataengineer/esift
 cd esift
 cargo build --release
 # binary is at ./target/release/esift
@@ -158,7 +158,7 @@ AWS OpenSearch Service with IAM/SigV4 auth is on the roadmap.
 
 - [ ] AWS SigV4 auth for managed OpenSearch domains
 - [ ] S3/Parquet destination
-- [ ] ClickHouse HTTP destination  
+- [ ] ClickHouse HTTP destination
 - [ ] Per-job checkpoint isolation (no shared checkpoint file across runs)
 - [ ] Field mapping via config (rename, drop, set timestamp)
 - [ ] Pre-built binaries via GitHub Releases
