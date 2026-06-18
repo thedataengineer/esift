@@ -34,7 +34,7 @@ impl OpenObserveDestination {
         stream: impl Into<String>,
         username: impl Into<String>,
         password: impl Into<String>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             client: Client::builder().build()?,
             base_url: base_url.into(),
@@ -85,16 +85,19 @@ impl Destination for OpenObserveDestination {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(EsiftError::Destination(format!(
                 "OpenObserve bulk failed: HTTP {} — {}",
                 status, text
             )));
         }
 
-        let result: serde_json::Value = resp.json().await?;
-        if result["errors"].as_bool().unwrap_or(false) {
-            warn!("Bulk response reported errors: {:?}", result);
+        let bulk_response: serde_json::Value = resp.json().await?;
+        if bulk_response["errors"].as_bool().unwrap_or(false) {
+            warn!("Bulk response reported errors: {:?}", bulk_response);
         }
 
         Ok(count)

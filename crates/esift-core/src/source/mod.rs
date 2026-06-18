@@ -21,4 +21,11 @@ pub trait Source: Send + Sync {
 
     /// Human-readable label for progress output.
     fn description(&self) -> String;
+
+    /// Current resume cursor, persisted to the checkpoint after each batch so a
+    /// later run can continue from this position. Sources that cannot resume
+    /// return None (the default).
+    fn cursor(&self) -> Option<Vec<serde_json::Value>> {
+        None
+    }
 }
