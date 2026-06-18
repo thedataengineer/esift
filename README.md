@@ -18,6 +18,8 @@ Most observability platforms assume logs are short-lived. esift is for the cases
 git clone https://github.com/thedataengineer/esift
 cd esift
 cargo build --release
+# Or with AWS SigV4 support:
+cargo build --release --features aws
 # binary is at ./target/release/esift
 ```
 
@@ -72,6 +74,10 @@ esift run
 | `--source-index` | required | Index name or pattern (e.g. `nginx-logs-*`) |
 | `--query` | `match_all` | Query DSL as a JSON string |
 | `--batch-size` | `500` | Documents per request |
+| `--source-auth-type` | — | Source auth type: `basic`, `aws-sigv4`, `none` (env: `ESIFT_SOURCE_AUTH_TYPE`) |
+| `--source-aws-region` | — | AWS region for SigV4 signing (env: `ESIFT_SOURCE_AWS_REGION`) |
+| `--source-username` | — | Username for basic auth (env: `ESIFT_SOURCE_USERNAME`) |
+| `--source-password` | — | Password for basic auth (env: `ESIFT_SOURCE_PASSWORD`) |
 | `--dest` | `stdout` | Destination: `stdout` or `openobserve` |
 | `--dest-url` | — | OpenObserve base URL |
 | `--dest-org` | `default` | OpenObserve organization |
@@ -92,6 +98,8 @@ batch_size = 500
 query = '{"match_all": {}}'
 # username = "admin"
 # password = "changeme"
+# auth_type = "aws-sigv4" # basic, aws-sigv4, none
+# aws_region = "us-east-1"
 
 [destination]
 type = "openobserve"
@@ -148,15 +156,13 @@ Planned: S3/Parquet, ClickHouse, local NDJSON file.
 |---|---|
 | OpenSearch 2.4+ | Tested |
 | Elasticsearch 7.10+ | Supported (auto-detected) |
-| AWS OpenSearch Service | Supported (basic auth / open access domains) |
-
-AWS OpenSearch Service with IAM/SigV4 auth is on the roadmap.
+| AWS OpenSearch Service | Supported (basic auth, IAM/SigV4 auth, or open access domains) |
 
 ---
 
 ## Roadmap
 
-- [ ] AWS SigV4 auth for managed OpenSearch domains
+- [x] AWS SigV4 auth for managed OpenSearch domains
 - [ ] S3/Parquet destination
 - [ ] ClickHouse HTTP destination
 - [ ] Per-job checkpoint isolation (no shared checkpoint file across runs)

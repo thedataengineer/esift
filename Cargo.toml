@@ -35,3 +35,8 @@ futures = "0.3"
 indicatif = "0.17"
 esift-core = { path = "crates/esift-core" }
 esift-transform = { path = "crates/esift-transform" }
+aws-config = { version = "1.1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-credential-types = { version = "1.1", default-features = false }
+aws-sigv4 = { version = "1.1", default-features = false, features = ["sign-http"] }
+aws-smithy-runtime-api = { version = "1.1", default-features = false, features = ["client"] }
+http = "1.0"

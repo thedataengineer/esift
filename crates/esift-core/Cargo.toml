@@ -5,16 +5,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+aws = [
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sigv4",
+    "dep:aws-smithy-runtime-api",
+    "dep:http",
+]
+
 [dependencies]
 tokio.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-chrono.workspace = true
-url.workspace = true
-bytes.workspace = true
-futures.workspace = true
+
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+wiremock = "0.6"
+tempfile = "3"

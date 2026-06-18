@@ -4,7 +4,10 @@ use esift_core::{
     checkpoint::CheckpointManager,
     config::{DestConfig, EsiftConfig},
     dest::{openobserve::OpenObserveDestination, stdout::StdoutDestination, Destination},
-    source::{opensearch::OpenSearchSource, Source},
+    source::{
+        opensearch::{Auth, OpenSearchSource},
+        Source,
+    },
 };
 use esift_transform::mapping::Transformer;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -63,6 +66,22 @@ enum Commands {
 
         #[arg(long, default_value = "./esift-checkpoint.json")]
         checkpoint: PathBuf,
+
+        /// Source authentication type: basic, aws-sigv4, none
+        #[arg(long, env = "ESIFT_SOURCE_AUTH_TYPE")]
+        source_auth_type: Option<String>,
+
+        /// AWS region for Signature Version 4 signing
+        #[arg(long, env = "ESIFT_SOURCE_AWS_REGION")]
+        source_aws_region: Option<String>,
+
+        /// Source username (for basic auth)
+        #[arg(long, env = "ESIFT_SOURCE_USERNAME")]
+        source_username: Option<String>,
+
+        /// Source password (for basic auth)
+        #[arg(long, env = "ESIFT_SOURCE_PASSWORD")]
+        source_password: Option<String>,
     },
 }
 
@@ -95,16 +114,30 @@ async fn main() -> Result<()> {
             dest_password,
             batch_size,
             checkpoint,
+            source_auth_type,
+            source_aws_region,
+            source_username,
+            source_password,
         } => {
             let query_value: serde_json::Value = serde_json::from_str(&query)?;
+
+            let auth = resolve_auth(
+                source_auth_type.as_deref(),
+                source_username,
+                source_password,
+                source_aws_region,
+            )
+            .await?;
+
+            let mut checkpoint_mgr = CheckpointManager::new(checkpoint)?;
 
             let mut source = OpenSearchSource::new(
                 &source_url,
                 &source_index,
                 query_value,
                 batch_size,
-                None,
-                None,
+                auth,
+                checkpoint_mgr.state.search_after.clone(),
             )?;
 
             let mut destination: Box<dyn Destination> = match dest.as_str() {
@@ -131,7 +164,6 @@ async fn main() -> Result<()> {
             };
 
             let transformer = Transformer::identity();
-            let mut checkpoint_mgr = CheckpointManager::new(checkpoint)?;
 
             run_extraction(
                 &mut source,
@@ -149,13 +181,23 @@ async fn main() -> Result<()> {
 async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
     let query: serde_json::Value = serde_json::from_str(&cfg.source.query)?;
 
+    let auth = resolve_auth(
+        cfg.source.auth_type.as_deref(),
+        cfg.source.username,
+        cfg.source.password,
+        cfg.source.aws_region,
+    )
+    .await?;
+
+    let mut checkpoint_mgr = CheckpointManager::new(cfg.checkpoint_path)?;
+
     let mut source = OpenSearchSource::new(
         &cfg.source.url,
         &cfg.source.index,
         query,
         cfg.source.batch_size,
-        cfg.source.username,
-        cfg.source.password,
+        auth,
+        checkpoint_mgr.state.search_after.clone(),
     )?;
 
     let mut destination: Box<dyn Destination> = match cfg.destination {
@@ -172,7 +214,6 @@ async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
     };
 
     let transformer = Transformer::identity();
-    let mut checkpoint_mgr = CheckpointManager::new(cfg.checkpoint_path)?;
 
     run_extraction(
         &mut source,
@@ -210,7 +251,7 @@ async fn run_extraction(
                 let transformed = transformer.apply_batch(docs);
                 match dest.write_batch(transformed).await {
                     Ok(written) => {
-                        checkpoint.state.record_batch(written, None);
+                        checkpoint.state.record_batch(written, source.cursor());
                         checkpoint.save()?;
                         total += written as u64;
                         progress.set_message(format!("{} documents extracted", total));
@@ -237,4 +278,82 @@ async fn run_extraction(
     dest.flush().await?;
     source.close().await?;
     Ok(())
+}
+
+// `aws_region` is only read on the aws-sigv4 path, which is compiled out when
+// the `aws` feature is off; silence the unused-variable warning in that build.
+#[cfg_attr(not(feature = "aws"), allow(unused_variables))]
+async fn resolve_auth(
+    auth_type: Option<&str>,
+    username: Option<String>,
+    password: Option<String>,
+    aws_region: Option<String>,
+) -> Result<Auth> {
+    match auth_type {
+        Some("aws-sigv4") => {
+            #[cfg(feature = "aws")]
+            {
+                use aws_config::BehaviorVersion;
+                let mut builder = aws_config::defaults(BehaviorVersion::latest());
+
+                let region = if let Some(r) = aws_region {
+                    Some(aws_config::Region::new(r))
+                } else if let Ok(r) = std::env::var("AWS_REGION") {
+                    Some(aws_config::Region::new(r))
+                } else if let Ok(r) = std::env::var("AWS_DEFAULT_REGION") {
+                    Some(aws_config::Region::new(r))
+                } else {
+                    None
+                };
+
+                if let Some(r) = region {
+                    builder = builder.region(r);
+                }
+
+                let sdk_config = builder.load().await;
+                let provider = sdk_config
+                    .credentials_provider()
+                    .ok_or_else(|| anyhow::anyhow!("No AWS credentials provider found. Please verify your environment variables or ~/.aws/credentials."))?;
+
+                let resolved_region = sdk_config
+                    .region()
+                    .map(|r| r.as_ref().to_string())
+                    .ok_or_else(|| anyhow::anyhow!("AWS region is required for aws-sigv4. Specify it via --source-aws-region, config file, or AWS_REGION environment variable."))?;
+
+                Ok(Auth::AwsSigV4 {
+                    region: resolved_region,
+                    provider: provider.clone(),
+                })
+            }
+            #[cfg(not(feature = "aws"))]
+            {
+                anyhow::bail!("AWS SigV4 authentication is not enabled. Recompile esift with the 'aws' feature enabled to use this feature.")
+            }
+        }
+        Some("basic") => {
+            let u =
+                username.ok_or_else(|| anyhow::anyhow!("Username is required for basic auth"))?;
+            Ok(Auth::Basic {
+                username: u,
+                password,
+            })
+        }
+        Some("none") => Ok(Auth::None),
+        Some(other) => {
+            anyhow::bail!(
+                "Unsupported source-auth-type '{}'. Use 'basic', 'aws-sigv4', or 'none'.",
+                other
+            )
+        }
+        None => {
+            if let Some(u) = username {
+                Ok(Auth::Basic {
+                    username: u,
+                    password,
+                })
+            } else {
+                Ok(Auth::None)
+            }
+        }
+    }
 }
