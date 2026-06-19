@@ -1,3 +1,4 @@
+pub mod datadog;
 pub mod file;
 pub mod opensearch;
 

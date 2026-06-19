@@ -32,6 +32,45 @@ pub struct SourceConfig {
     /// Parallel extraction slices (sliced PIT). 1 = single slice.
     #[serde(default = "default_slices")]
     pub slices: usize,
+
+    // --- Datadog source fields (all optional; used by the datadog-archive and
+    // datadog-api kinds; ignored by opensearch/file). ---
+    /// Datadog archive: object-storage bucket holding the archive.
+    #[serde(default)]
+    pub dd_bucket: Option<String>,
+    /// Datadog archive: key prefix within the bucket.
+    #[serde(default)]
+    pub dd_prefix: Option<String>,
+    /// Datadog archive: cloud region of the bucket.
+    #[serde(default)]
+    pub dd_region: Option<String>,
+    /// Datadog archive: compression codec ("zstd", "gzip", or "auto" by suffix).
+    #[serde(default)]
+    pub dd_compression: Option<String>,
+    /// Datadog archive: object-storage provider ("s3"; gcs/azure reserved).
+    #[serde(default)]
+    pub dd_cloud: Option<String>,
+    /// Datadog API: site, e.g. "datadoghq.com" (US1) or "datadoghq.eu".
+    #[serde(default)]
+    pub dd_site: Option<String>,
+    /// Datadog API: API key (DD-API-KEY). Supports env:/file: secret sources.
+    #[serde(default)]
+    pub dd_api_key: Option<String>,
+    /// Datadog API: application key (DD-APPLICATION-KEY).
+    #[serde(default)]
+    pub dd_app_key: Option<String>,
+    /// Datadog API: log search query (default "*").
+    #[serde(default)]
+    pub dd_query: Option<String>,
+    /// Datadog (both paths): start of time range, ISO8601.
+    #[serde(default)]
+    pub dd_from: Option<String>,
+    /// Datadog (both paths): end of time range, ISO8601.
+    #[serde(default)]
+    pub dd_to: Option<String>,
+    /// Datadog API: time-window chunk size in minutes (default 60).
+    #[serde(default)]
+    pub dd_window_minutes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -266,6 +266,58 @@ async fn build_source(
                 .ok_or_else(|| anyhow::anyhow!("source.path is required for the file source"))?;
             Ok(Box::new(FileSource::new(path)?))
         }
+        "datadog-archive" => {
+            use esift_core::source::datadog::archive::{Compression, DatadogArchiveSource};
+            use esift_core::source::datadog::decompress::Codec;
+
+            let bucket = cfg.dd_bucket.clone().ok_or_else(|| {
+                anyhow::anyhow!("source.dd_bucket is required for the datadog-archive source")
+            })?;
+            let prefix = cfg.dd_prefix.clone().unwrap_or_default();
+            let compression = match cfg.dd_compression.as_deref() {
+                None | Some("auto") => Compression::Auto,
+                Some("zstd") => Compression::Fixed(Codec::Zstd),
+                Some("gzip") => Compression::Fixed(Codec::Gzip),
+                Some(other) => {
+                    anyhow::bail!("unknown dd_compression '{other}'. Use 'zstd', 'gzip', or 'auto'")
+                }
+            };
+            Ok(Box::new(DatadogArchiveSource::new(
+                bucket,
+                prefix,
+                cfg.dd_region.clone(),
+                cfg.dd_from.clone(),
+                cfg.dd_to.clone(),
+                compression,
+                resume_after,
+            )?))
+        }
+        "datadog-api" => {
+            use esift_core::source::datadog::api::DatadogApiSource;
+
+            let api_key = secret::resolve_opt(cfg.dd_api_key.clone())?.ok_or_else(|| {
+                anyhow::anyhow!("source.dd_api_key is required for the datadog-api source")
+            })?;
+            let app_key = secret::resolve_opt(cfg.dd_app_key.clone())?.ok_or_else(|| {
+                anyhow::anyhow!("source.dd_app_key is required for the datadog-api source")
+            })?;
+            let site = cfg
+                .dd_site
+                .clone()
+                .unwrap_or_else(|| "datadoghq.com".into());
+            let query = cfg.dd_query.clone().unwrap_or_else(|| "*".into());
+            let window_minutes = cfg.dd_window_minutes.unwrap_or(60);
+            Ok(Box::new(DatadogApiSource::new(
+                site,
+                api_key,
+                app_key,
+                query,
+                cfg.dd_from.clone(),
+                cfg.dd_to.clone(),
+                window_minutes,
+                resume_after,
+            )?))
+        }
         "opensearch" | "" => {
             if cfg.url.is_empty() || cfg.index.is_empty() {
                 anyhow::bail!("source.url and source.index are required for the opensearch source");

@@ -16,6 +16,8 @@ aws = [
     "dep:aws-credential-types",
 ]
 s3 = ["esift-core/s3"]
+datadog-s3 = ["esift-core/datadog-s3"]
+datadog-api = ["esift-core/datadog-api"]
 
 [dependencies]
 tokio.workspace = true
