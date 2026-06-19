@@ -47,7 +47,9 @@ pub struct SourceConfig {
     /// Datadog archive: compression codec ("zstd", "gzip", or "auto" by suffix).
     #[serde(default)]
     pub dd_compression: Option<String>,
-    /// Datadog archive: object-storage provider ("s3"; gcs/azure reserved).
+    /// Datadog archive: object-storage provider. `"s3"` (default) | `"gcs"` |
+    /// `"azure"`. Each requires the matching build feature (`datadog-s3` /
+    /// `datadog-gcs` / `datadog-azure`).
     #[serde(default)]
     pub dd_cloud: Option<String>,
     /// Datadog API: site, e.g. "datadoghq.com" (US1) or "datadoghq.eu".

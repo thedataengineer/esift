@@ -74,6 +74,10 @@ enum Commands {
         #[arg(long)]
         source_dd_compression: Option<String>,
 
+        /// Datadog archive: object-storage cloud ("s3" (default), "gcs", "azure")
+        #[arg(long)]
+        source_dd_cloud: Option<String>,
+
         /// Datadog (both paths): start of time range, ISO8601
         #[arg(long)]
         source_dd_from: Option<String>,
@@ -179,6 +183,7 @@ async fn main() -> Result<()> {
             source_dd_prefix,
             source_dd_region,
             source_dd_compression,
+            source_dd_cloud,
             source_dd_from,
             source_dd_to,
             source_dd_site,
@@ -252,7 +257,7 @@ async fn main() -> Result<()> {
                         dd_prefix: source_dd_prefix,
                         dd_region: source_dd_region,
                         dd_compression: source_dd_compression,
-                        dd_cloud: None,
+                        dd_cloud: source_dd_cloud,
                         dd_site: source_dd_site,
                         dd_api_key: source_dd_api_key,
                         dd_app_key: source_dd_app_key,
@@ -372,7 +377,9 @@ async fn build_source(
             Ok(Box::new(FileSource::new(path)?))
         }
         "datadog-archive" => {
-            use esift_core::source::datadog::archive::{Compression, DatadogArchiveSource};
+            use esift_core::source::datadog::archive::{
+                CloudProvider, Compression, DatadogArchiveSource,
+            };
             use esift_core::source::datadog::decompress::Codec;
 
             let bucket = cfg.dd_bucket.clone().ok_or_else(|| {
@@ -387,15 +394,19 @@ async fn build_source(
                     anyhow::bail!("unknown dd_compression '{other}'. Use 'zstd', 'gzip', or 'auto'")
                 }
             };
-            Ok(Box::new(DatadogArchiveSource::new(
-                bucket,
-                prefix,
-                cfg.dd_region.clone(),
-                cfg.dd_from.clone(),
-                cfg.dd_to.clone(),
-                compression,
-                resume_after,
-            )?))
+            let cloud = CloudProvider::parse(cfg.dd_cloud.as_deref().unwrap_or("s3"))?;
+            Ok(Box::new(
+                DatadogArchiveSource::new(
+                    bucket,
+                    prefix,
+                    cfg.dd_region.clone(),
+                    cfg.dd_from.clone(),
+                    cfg.dd_to.clone(),
+                    compression,
+                    resume_after,
+                )?
+                .with_cloud(cloud),
+            ))
         }
         "datadog-api" => {
             use esift_core::source::datadog::api::DatadogApiSource;
@@ -636,6 +647,30 @@ mod tests {
                 assert_eq!(source_dd_bucket.as_deref(), Some("my-bucket"));
                 assert_eq!(source_dd_prefix.as_deref(), Some("logs/"));
                 assert_eq!(source_dd_region.as_deref(), Some("us-east-1"));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_parses_datadog_archive_cloud_flag() {
+        let cli = Cli::try_parse_from([
+            "esift",
+            "extract",
+            "--source-type",
+            "datadog-archive",
+            "--source-dd-bucket",
+            "my-container",
+            "--source-dd-cloud",
+            "azure",
+        ])
+        .expect("--source-dd-cloud should parse");
+
+        match cli.command {
+            Commands::Extract {
+                source_dd_cloud, ..
+            } => {
+                assert_eq!(source_dd_cloud.as_deref(), Some("azure"));
             }
             _ => panic!("expected extract command"),
         }

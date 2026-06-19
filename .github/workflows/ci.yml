@@ -59,10 +59,16 @@ jobs:
       - name: Default features — check esift-core
         run: cargo check -p esift-core
       - name: Default features — assert no Datadog-only deps
-        run: "! cargo tree -e no-dev | grep -E 'zstd|aws-sdk-s3'"
+        run: "! cargo tree -e no-dev | grep -E 'zstd|aws-sdk-s3|google-cloud-storage|azure_storage_blob'"
       - name: Feature datadog-s3
         run: cargo check --features datadog-s3
+      - name: Feature datadog-gcs
+        run: cargo check --features datadog-gcs
+      - name: Feature datadog-azure
+        run: cargo check --features datadog-azure
       - name: Feature datadog-api
         run: cargo check --features datadog-api
       - name: Features datadog-s3,datadog-api
         run: cargo check --features datadog-s3,datadog-api
+      - name: Features all Datadog backends
+        run: cargo check --features datadog-s3,datadog-api,datadog-gcs,datadog-azure
