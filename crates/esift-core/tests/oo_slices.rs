@@ -99,9 +99,12 @@ async fn sliced_extraction_drains_all_slices_and_completes() {
 
     source.open().await.unwrap();
 
-    // With slices > 1 a single checkpoint cursor cannot represent N slice
-    // cursors, so cursor() must stay None throughout the run.
-    assert_eq!(source.cursor(), None, "sliced runs expose no resume cursor");
+    // With slices > 1 the per-slice cursors are encoded into one opaque value,
+    // so a sliced run exposes a resume cursor once the PIT is open.
+    assert!(
+        source.cursor().is_some(),
+        "sliced runs expose an encoded resume cursor"
+    );
 
     // Drain every batch until the source reports exhaustion, collecting ids.
     let mut ids = Vec::new();
@@ -110,7 +113,7 @@ async fn sliced_extraction_drains_all_slices_and_completes() {
             assert_eq!(doc.index, "logs");
             ids.push(doc.id);
         }
-        assert_eq!(source.cursor(), None, "cursor stays None mid-run");
+        assert!(source.cursor().is_some(), "cursor present mid-run");
     }
 
     ids.sort();
