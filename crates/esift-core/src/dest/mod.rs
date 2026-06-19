@@ -1,4 +1,6 @@
+pub mod file;
 pub mod openobserve;
+pub mod s3;
 pub mod stdout;
 
 use crate::{error::Result, Document};

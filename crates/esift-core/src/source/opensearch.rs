@@ -57,6 +57,7 @@ pub struct OpenSearchSource {
     search_after: Option<Vec<Value>>,
     exhausted: bool,
     flavor: ApiFlavor,
+    slices: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,7 +107,15 @@ impl OpenSearchSource {
             search_after: resume_after,
             exhausted: false,
             flavor: ApiFlavor::Unknown,
+            slices: 1,
         })
+    }
+
+    /// Set the number of parallel extraction slices (sliced PIT). Values below
+    /// 1 are treated as 1. Lane 4 fans extraction out across these slices.
+    pub fn with_slices(mut self, slices: usize) -> Self {
+        self.slices = slices.max(1);
+        self
     }
 
     async fn execute_request(
@@ -441,7 +450,10 @@ impl Source for OpenSearchSource {
     }
 
     fn description(&self) -> String {
-        format!("OpenSearch {} index={}", self.base_url, self.index)
+        format!(
+            "OpenSearch {} index={} slices={}",
+            self.base_url, self.index, self.slices
+        )
     }
 
     fn cursor(&self) -> Option<Vec<Value>> {

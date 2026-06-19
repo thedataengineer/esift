@@ -2,10 +2,18 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
-    /// Base URL of the OpenSearch / Elasticsearch cluster
+    /// Source kind: "opensearch" (default) or "file".
+    #[serde(default = "default_source_kind")]
+    pub kind: String,
+    /// Base URL of the OpenSearch / Elasticsearch cluster (opensearch kind).
+    #[serde(default)]
     pub url: String,
-    /// Index name or pattern (e.g. "nginx-logs-*")
+    /// Index name or pattern, e.g. "nginx-logs-*" (opensearch kind).
+    #[serde(default)]
     pub index: String,
+    /// Path to an NDJSON file (file kind).
+    #[serde(default)]
+    pub path: Option<String>,
     /// Optional basic auth
     pub username: Option<String>,
     pub password: Option<String>,
@@ -21,6 +29,9 @@ pub struct SourceConfig {
     /// Documents per batch
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Parallel extraction slices (sliced PIT). 1 = single slice.
+    #[serde(default = "default_slices")]
+    pub slices: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +46,18 @@ pub enum DestConfig {
         #[serde(default)]
         options: Box<crate::dest::openobserve::OpenObserveOptions>,
     },
+    /// Newline-delimited JSON to a local file.
+    File {
+        path: String,
+    },
+    /// Objects written to an S3-compatible bucket.
+    S3 {
+        bucket: String,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        region: Option<String>,
+    },
     Stdout,
 }
 
@@ -44,6 +67,20 @@ pub struct EsiftConfig {
     pub destination: DestConfig,
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
+    /// Document transforms applied between source and destination.
+    #[serde(default)]
+    pub transforms: Vec<crate::transform::Transform>,
+    /// Optional address (e.g. "127.0.0.1:9090") to serve Prometheus metrics on.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
+}
+
+fn default_source_kind() -> String {
+    "opensearch".into()
+}
+
+fn default_slices() -> usize {
+    1
 }
 
 fn default_query() -> String {

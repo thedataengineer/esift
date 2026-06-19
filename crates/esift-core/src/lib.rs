@@ -4,6 +4,7 @@ pub mod dest;
 pub mod error;
 pub mod http;
 pub mod source;
+pub mod transform;
 
 /// A single document extracted from a source.
 ///
