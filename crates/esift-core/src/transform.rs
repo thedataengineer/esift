@@ -12,4 +12,8 @@ pub enum Transform {
     Rename { from: String, to: String },
     Drop { field: String },
     SetTimestamp { from: String },
+    Lowercase { field: String },
+    Copy { from: String, to: String },
+    Coerce { field: String, to: String },
+    JsonParse { field: String },
 }
