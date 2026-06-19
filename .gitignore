@@ -2,3 +2,5 @@
 esift-checkpoint.json
 esift-checkpoint.tmp
 .env
+# Claude Code agent worktrees (ephemeral; created during parallel agent runs)
+/.claude/
