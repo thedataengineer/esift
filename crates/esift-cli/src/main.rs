@@ -18,6 +18,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{error, info};
 
+mod secret;
+
 #[derive(Parser)]
 #[command(name = "esift")]
 #[command(about = "Extract and re-ingest data from Elasticsearch-compatible sources")]
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
         } => {
             let query_value: serde_json::Value = serde_json::from_str(&query)?;
 
+            let source_password = secret::resolve_opt(source_password)?;
             let auth = resolve_auth(
                 source_auth_type.as_deref(),
                 source_username,
@@ -157,6 +160,7 @@ async fn main() -> Result<()> {
                     let password = dest_password.ok_or_else(|| {
                         anyhow::anyhow!("--dest-password required for openobserve")
                     })?;
+                    let password = secret::resolve(&password)?;
                     Box::new(OpenObserveDestination::new(
                         url,
                         dest_org,
@@ -190,10 +194,11 @@ async fn main() -> Result<()> {
 async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
     let query: serde_json::Value = serde_json::from_str(&cfg.source.query)?;
 
+    let source_password = secret::resolve_opt(cfg.source.password)?;
     let auth = resolve_auth(
         cfg.source.auth_type.as_deref(),
         cfg.source.username,
-        cfg.source.password,
+        source_password,
         cfg.source.aws_region,
     )
     .await?;
@@ -218,9 +223,14 @@ async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
             username,
             password,
             options,
-        } => Box::new(OpenObserveDestination::new(
-            url, org, stream, username, password, *options,
-        )?),
+        } => {
+            let password = secret::resolve(&password)?;
+            let mut options = *options;
+            options.token = secret::resolve_opt(options.token)?;
+            Box::new(OpenObserveDestination::new(
+                url, org, stream, username, password, options,
+            )?)
+        }
     };
 
     let transformer = Transformer::identity();
