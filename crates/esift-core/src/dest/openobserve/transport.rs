@@ -3,9 +3,13 @@
 //! Foundation stub: a plain POST with basic/token auth and no compression, then
 //! status classification. Lane 3 adds gzip request compression here.
 
+use super::config::Compression;
 use super::types::BulkChunk;
 use super::{auth, SinkContext};
 use crate::error::{EsiftError, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression as GzLevel;
+use std::io::Write;
 
 /// POST one chunk to the bulk endpoint.
 pub(crate) async fn send(ctx: &SinkContext, chunk: &BulkChunk) -> Result<reqwest::Response> {
@@ -14,8 +18,16 @@ pub(crate) async fn send(ctx: &SinkContext, chunk: &BulkChunk) -> Result<reqwest
         .post(&ctx.bulk_url)
         .header("Content-Type", "application/x-ndjson");
     let builder = auth::apply(builder, ctx);
-    // body is cloned because retry may resend; lane 3 swaps this for a gzip path.
-    let builder = builder.body(chunk.body.clone());
+    // body is cloned/encoded fresh because retry may resend.
+    let builder = match ctx.options.compression {
+        Compression::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), GzLevel::default());
+            encoder.write_all(chunk.body.as_bytes())?;
+            let compressed = encoder.finish()?;
+            builder.header("Content-Encoding", "gzip").body(compressed)
+        }
+        Compression::None => builder.body(chunk.body.clone()),
+    };
     Ok(builder.send().await?)
 }
 
