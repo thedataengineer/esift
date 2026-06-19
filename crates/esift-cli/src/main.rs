@@ -45,14 +45,62 @@ enum Commands {
     },
     /// Quick extraction with inline flags (no config file needed)
     Extract {
+        /// Source kind: opensearch (default), datadog-archive, or datadog-api
+        #[arg(long, default_value = "opensearch")]
+        source_type: String,
+
         #[arg(long, env = "ESIFT_SOURCE_URL")]
-        source_url: String,
+        source_url: Option<String>,
 
         #[arg(long)]
-        source_index: String,
+        source_index: Option<String>,
 
         #[arg(long, default_value = r#"{"match_all":{}}"#)]
         query: String,
+
+        /// Datadog archive: object-storage bucket holding the archive
+        #[arg(long)]
+        source_dd_bucket: Option<String>,
+
+        /// Datadog archive: key prefix within the bucket
+        #[arg(long)]
+        source_dd_prefix: Option<String>,
+
+        /// Datadog archive: cloud region of the bucket
+        #[arg(long)]
+        source_dd_region: Option<String>,
+
+        /// Datadog archive: compression codec ("zstd", "gzip", or "auto")
+        #[arg(long)]
+        source_dd_compression: Option<String>,
+
+        /// Datadog (both paths): start of time range, ISO8601
+        #[arg(long)]
+        source_dd_from: Option<String>,
+
+        /// Datadog (both paths): end of time range, ISO8601
+        #[arg(long)]
+        source_dd_to: Option<String>,
+
+        /// Datadog API: site, e.g. "datadoghq.com" or "datadoghq.eu"
+        #[arg(long)]
+        source_dd_site: Option<String>,
+
+        /// Datadog API: API key (DD-API-KEY). Supports env:/file: secret sources
+        #[arg(long, env = "DD_API_KEY")]
+        source_dd_api_key: Option<String>,
+
+        /// Datadog API: application key (DD-APPLICATION-KEY)
+        #[arg(long, env = "DD_APP_KEY")]
+        source_dd_app_key: Option<String>,
+
+        /// Datadog API: log search query (default "*")
+        #[arg(long)]
+        source_dd_query: Option<String>,
+
+        /// Datadog API: time-window chunk size in minutes (default 60)
+        #[arg(long)]
+        source_dd_window_minutes: Option<u64>,
 
         /// Destination: stdout or openobserve
         #[arg(long, default_value = "stdout")]
@@ -123,9 +171,21 @@ async fn main() -> Result<()> {
         }
 
         Commands::Extract {
+            source_type,
             source_url,
             source_index,
             query,
+            source_dd_bucket,
+            source_dd_prefix,
+            source_dd_region,
+            source_dd_compression,
+            source_dd_from,
+            source_dd_to,
+            source_dd_site,
+            source_dd_api_key,
+            source_dd_app_key,
+            source_dd_query,
+            source_dd_window_minutes,
             dest,
             dest_url,
             dest_org,
@@ -141,28 +201,73 @@ async fn main() -> Result<()> {
             slices,
             metrics_addr,
         } => {
-            let query_value: serde_json::Value = serde_json::from_str(&query)?;
-
-            let source_password = secret::resolve_opt(source_password)?;
-            let auth = resolve_auth(
-                source_auth_type.as_deref(),
-                source_username,
-                source_password,
-                source_aws_region,
-            )
-            .await?;
-
             let mut checkpoint_mgr = CheckpointManager::new(checkpoint)?;
+            let resume_after = checkpoint_mgr.state.search_after.clone();
 
-            let mut source = OpenSearchSource::new(
-                &source_url,
-                &source_index,
-                query_value,
-                batch_size,
-                auth,
-                checkpoint_mgr.state.search_after.clone(),
-            )?
-            .with_slices(slices);
+            let mut source: Box<dyn Source> = match source_type.as_str() {
+                "opensearch" | "" => {
+                    let source_url = source_url.ok_or_else(|| {
+                        anyhow::anyhow!("--source-url is required for the opensearch source")
+                    })?;
+                    let source_index = source_index.ok_or_else(|| {
+                        anyhow::anyhow!("--source-index is required for the opensearch source")
+                    })?;
+                    let query_value: serde_json::Value = serde_json::from_str(&query)?;
+
+                    let source_password = secret::resolve_opt(source_password)?;
+                    let auth = resolve_auth(
+                        source_auth_type.as_deref(),
+                        source_username,
+                        source_password,
+                        source_aws_region,
+                    )
+                    .await?;
+
+                    Box::new(
+                        OpenSearchSource::new(
+                            &source_url,
+                            &source_index,
+                            query_value,
+                            batch_size,
+                            auth,
+                            resume_after,
+                        )?
+                        .with_slices(slices),
+                    )
+                }
+                "datadog-archive" | "datadog-api" => {
+                    let cfg = SourceConfig {
+                        kind: source_type.clone(),
+                        url: String::new(),
+                        index: String::new(),
+                        path: None,
+                        username: None,
+                        password: None,
+                        auth_type: None,
+                        aws_region: None,
+                        query: r#"{"match_all":{}}"#.into(),
+                        batch_size,
+                        slices,
+                        dd_bucket: source_dd_bucket,
+                        dd_prefix: source_dd_prefix,
+                        dd_region: source_dd_region,
+                        dd_compression: source_dd_compression,
+                        dd_cloud: None,
+                        dd_site: source_dd_site,
+                        dd_api_key: source_dd_api_key,
+                        dd_app_key: source_dd_app_key,
+                        dd_query: source_dd_query,
+                        dd_from: source_dd_from,
+                        dd_to: source_dd_to,
+                        dd_window_minutes: source_dd_window_minutes,
+                    };
+                    build_source(&cfg, resume_after).await?
+                }
+                other => anyhow::bail!(
+                    "Unknown source-type '{}'. Use 'opensearch', 'datadog-archive', or 'datadog-api'",
+                    other
+                ),
+            };
 
             let mut destination: Box<dyn Destination> = match dest.as_str() {
                 "stdout" => Box::new(StdoutDestination),
@@ -197,7 +302,7 @@ async fn main() -> Result<()> {
             let metrics = start_metrics(metrics_addr);
 
             run_extraction(
-                &mut source,
+                &mut *source,
                 &mut *destination,
                 &transformer,
                 &mut checkpoint_mgr,
@@ -495,6 +600,100 @@ async fn resolve_auth(
             } else {
                 Ok(Auth::None)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_parses_datadog_archive_flags() {
+        let cli = Cli::try_parse_from([
+            "esift",
+            "extract",
+            "--source-type",
+            "datadog-archive",
+            "--source-dd-bucket",
+            "my-bucket",
+            "--source-dd-prefix",
+            "logs/",
+            "--source-dd-region",
+            "us-east-1",
+        ])
+        .expect("datadog-archive flags should parse");
+
+        match cli.command {
+            Commands::Extract {
+                source_type,
+                source_dd_bucket,
+                source_dd_prefix,
+                source_dd_region,
+                ..
+            } => {
+                assert_eq!(source_type, "datadog-archive");
+                assert_eq!(source_dd_bucket.as_deref(), Some("my-bucket"));
+                assert_eq!(source_dd_prefix.as_deref(), Some("logs/"));
+                assert_eq!(source_dd_region.as_deref(), Some("us-east-1"));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_parses_datadog_api_flags() {
+        let cli = Cli::try_parse_from([
+            "esift",
+            "extract",
+            "--source-type",
+            "datadog-api",
+            "--source-dd-api-key",
+            "key",
+            "--source-dd-app-key",
+            "app",
+            "--source-dd-query",
+            "service:web",
+            "--source-dd-window-minutes",
+            "30",
+        ])
+        .expect("datadog-api flags should parse");
+
+        match cli.command {
+            Commands::Extract {
+                source_type,
+                source_dd_api_key,
+                source_dd_app_key,
+                source_dd_query,
+                source_dd_window_minutes,
+                ..
+            } => {
+                assert_eq!(source_type, "datadog-api");
+                assert_eq!(source_dd_api_key.as_deref(), Some("key"));
+                assert_eq!(source_dd_app_key.as_deref(), Some("app"));
+                assert_eq!(source_dd_query.as_deref(), Some("service:web"));
+                assert_eq!(source_dd_window_minutes, Some(30));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_defaults_to_opensearch_with_optional_url_and_index() {
+        // url/index are now optional at parse time; the opensearch handler
+        // validates their presence at runtime.
+        let cli = Cli::try_parse_from(["esift", "extract"]).expect("bare extract should parse");
+        match cli.command {
+            Commands::Extract {
+                source_type,
+                source_index,
+                ..
+            } => {
+                assert_eq!(source_type, "opensearch");
+                // --source-index is not env-backed, so it stays None when omitted.
+                assert!(source_index.is_none());
+            }
+            _ => panic!("expected extract command"),
         }
     }
 }
