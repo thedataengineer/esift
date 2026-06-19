@@ -4,11 +4,11 @@
 //! [`EsiftError::Transient`](crate::error::EsiftError::Transient). Any other
 //! error, or success, returns immediately.
 //!
-//! Foundation stub: runs the operation exactly once, so the sink behaves
-//! exactly as it did before the refactor. Lane 2 replaces [`run`] with a real
-//! capped-exponential-backoff loop.
+//! Backoff is capped exponential: retry attempt `n` (1-based) waits
+//! `min(base_backoff_ms * 2^(n-1), max_backoff_ms)` milliseconds before the
+//! next call.
 
-use crate::error::Result;
+use crate::error::{EsiftError, Result};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
@@ -46,12 +46,81 @@ fn default_max_backoff_ms() -> u64 {
 
 /// Run `op`, retrying transient failures per `policy`.
 ///
-/// Foundation stub: a single attempt. Lane 2 implements the backoff loop that
-/// retries while the error is `EsiftError::Transient` and attempts remain.
-pub async fn run<F, Fut, T>(_policy: &RetryPolicy, op: F) -> Result<T>
+/// On `Ok`, returns immediately. On `Err(EsiftError::Transient(_))`, retries
+/// up to `policy.max_retries` times, sleeping a capped exponential backoff
+/// between attempts. Any other error returns immediately.
+pub async fn run<F, Fut, T>(policy: &RetryPolicy, op: F) -> Result<T>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    op().await
+    let mut retries: u32 = 0;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if matches!(e, EsiftError::Transient(_)) && retries < policy.max_retries {
+                    retries += 1;
+                    let shift = retries - 1;
+                    let backoff_ms = policy
+                        .base_backoff_ms
+                        .checked_shl(shift)
+                        .unwrap_or(u64::MAX)
+                        .min(policy.max_backoff_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::EsiftError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retries_transient_until_success() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base_backoff_ms: 1,
+            max_backoff_ms: 5,
+        };
+        let calls = AtomicUsize::new(0);
+
+        let result = run(&policy, || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(EsiftError::Transient("temporary".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_transient_is_not_retried() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base_backoff_ms: 1,
+            max_backoff_ms: 5,
+        };
+        let calls = AtomicUsize::new(0);
+
+        let result = run(&policy, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(EsiftError::Destination("permanent".into()))
+        })
+        .await;
+
+        assert!(matches!(result, Err(EsiftError::Destination(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
