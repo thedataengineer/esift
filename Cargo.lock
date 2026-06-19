@@ -793,6 +793,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "flate2",
  "http 1.4.2",
  "reqwest",
  "serde",
