@@ -90,6 +90,48 @@ async fn response_body(resp: reqwest::Response) -> String {
         .unwrap_or_else(|e| format!("<failed to read response body: {e}>"))
 }
 
+/// Marker key identifying a sliced-resume cursor inside the opaque checkpoint
+/// cursor. A single-slice cursor is an array of `sort` values and never a
+/// one-element array holding an object with this key, so the two are
+/// unambiguous.
+const SLICE_MARKER: &str = "__esift_slices";
+
+/// Whether `cursor` is a sliced-resume encoding produced by [`OpenSearchSource::cursor`].
+fn is_sliced_encoding(cursor: &[Value]) -> bool {
+    cursor.len() == 1
+        && cursor[0]
+            .as_object()
+            .is_some_and(|o| o.contains_key(SLICE_MARKER))
+}
+
+/// Decode a sliced-resume cursor into per-slice state. Returns `None` (start
+/// fresh) when the encoding is malformed or its slice count differs from this
+/// run's `slices`.
+fn decode_slice_cursors(cursor: &[Value], slices: usize) -> Option<Vec<SliceState>> {
+    let obj = cursor.first()?.as_object()?;
+    let saved = obj.get(SLICE_MARKER)?.as_u64()? as usize;
+    if saved != slices {
+        warn!(
+            "checkpoint was written with {saved} slices but this run uses {slices}; \
+             starting sliced extraction fresh"
+        );
+        return None;
+    }
+    let entries = obj.get("cursors")?.as_array()?;
+    if entries.len() != slices {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .map(|entry| SliceState {
+                search_after: entry.get("after").and_then(|a| a.as_array().cloned()),
+                exhausted: entry.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
+            })
+            .collect(),
+    )
+}
+
 impl OpenSearchSource {
     /// Build a source. `resume_after` seeds the `search_after` cursor from a
     /// prior checkpoint so a resumed run continues where it left off; pass
@@ -289,12 +331,36 @@ impl OpenSearchSource {
         Ok(())
     }
 
-    /// Allocate one cursor per slice for the sliced path. Called from `open()`
-    /// once the PIT exists; a no-op when `slices <= 1`.
-    fn init_slice_state(&mut self) {
+    /// Prepare per-slice cursors after the PIT is established. For the sliced
+    /// path this allocates one cursor per slice and, when the checkpoint carries
+    /// a sliced-resume encoding, restores each slice's `search_after` and
+    /// exhaustion so the run continues where it left off. For the single-slice
+    /// path it discards an incompatible sliced encoding (e.g. a run that dropped
+    /// from many slices to one) and starts fresh. Called from `open()`.
+    fn seed_cursors(&mut self) {
+        let sliced_encoding = self.search_after.as_deref().is_some_and(is_sliced_encoding);
+
         if self.slices > 1 {
             self.slice_state = vec![SliceState::default(); self.slices];
             self.next_slice = 0;
+            if sliced_encoding {
+                if let Some(decoded) =
+                    decode_slice_cursors(self.search_after.as_ref().unwrap(), self.slices)
+                {
+                    if decoded.iter().all(|s| s.exhausted) {
+                        self.exhausted = true;
+                    }
+                    self.slice_state = decoded;
+                }
+            }
+            // A single-slice cursor is meaningless in sliced mode.
+            self.search_after = None;
+        } else if sliced_encoding {
+            warn!(
+                "checkpoint was written with sliced extraction; a single-slice run \
+                 cannot resume from it, starting fresh"
+            );
+            self.search_after = None;
         }
     }
 
@@ -406,9 +472,9 @@ impl OpenSearchSource {
 
     /// Sliced extraction: one shared PIT, one `search_after` cursor per slice.
     /// Advances slices round-robin, skipping exhausted ones, and is exhausted
-    /// only once every slice has drained. A single checkpoint cursor cannot
-    /// represent N slice cursors, so `cursor()` returns `None` here and a
-    /// mid-run resume is not available with `slices > 1`.
+    /// only once every slice has drained. `cursor()` encodes all per-slice
+    /// cursors into one opaque checkpoint value, so a sliced run resumes
+    /// mid-flight when restarted with the same `slices`.
     async fn next_batch_sliced(&mut self) -> Result<Option<Vec<Document>>> {
         let count = self.slice_state.len();
         for _ in 0..count {
@@ -467,7 +533,7 @@ impl Source for OpenSearchSource {
             debug!("PIT id: {}", pit_id);
             self.pit_id = Some(pit_id);
             self.flavor = ApiFlavor::OpenSearch;
-            self.init_slice_state();
+            self.seed_cursors();
             return Ok(());
         }
 
@@ -491,7 +557,7 @@ impl Source for OpenSearchSource {
                 info!("PIT opened (Elasticsearch)");
                 self.pit_id = Some(pit_id);
                 self.flavor = ApiFlavor::Elasticsearch;
-                self.init_slice_state();
+                self.seed_cursors();
                 return Ok(());
             }
 
@@ -559,15 +625,147 @@ impl Source for OpenSearchSource {
     }
 
     fn cursor(&self) -> Option<Vec<Value>> {
-        // Sliced extraction keeps one `search_after` cursor per slice, which a
-        // single checkpoint value cannot represent. Return `None` so the
-        // checkpoint layer does not record a partial cursor; mid-run resume is
-        // unavailable when `slices > 1`. Resume seeding (`resume_after`) applies
-        // only to the single-slice path.
         if self.slices > 1 {
-            return None;
+            // Encode every slice's cursor and exhaustion into one opaque value
+            // so the checkpoint layer can persist it like any other cursor; only
+            // this source interprets it (see `seed_cursors`). None before the
+            // slices are initialized (i.e. before `open`).
+            if self.slice_state.is_empty() {
+                return None;
+            }
+            let cursors: Vec<Value> = self
+                .slice_state
+                .iter()
+                .map(|s| json!({ "after": s.search_after, "done": s.exhausted }))
+                .collect();
+            return Some(vec![
+                json!({ (SLICE_MARKER): self.slices, "cursors": cursors }),
+            ]);
         }
         self.search_after.clone()
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn source(slices: usize) -> OpenSearchSource {
+        OpenSearchSource::new(
+            "http://localhost:9200",
+            "idx",
+            json!({ "match_all": {} }),
+            10,
+            Auth::None,
+            None,
+        )
+        .unwrap()
+        .with_slices(slices)
+    }
+
+    #[test]
+    fn sliced_cursor_round_trips_through_seed() {
+        let mut src = source(2);
+        src.slice_state = vec![
+            SliceState {
+                search_after: Some(vec![json!("a")]),
+                exhausted: false,
+            },
+            SliceState {
+                search_after: Some(vec![json!("b")]),
+                exhausted: true,
+            },
+        ];
+
+        let encoded = src.cursor().expect("sliced cursor should encode");
+        assert!(is_sliced_encoding(&encoded));
+
+        let mut resumed = OpenSearchSource::new(
+            "http://localhost:9200",
+            "idx",
+            json!({ "match_all": {} }),
+            10,
+            Auth::None,
+            Some(encoded),
+        )
+        .unwrap()
+        .with_slices(2);
+        resumed.seed_cursors();
+
+        assert_eq!(resumed.slice_state[0].search_after, Some(vec![json!("a")]));
+        assert!(!resumed.slice_state[0].exhausted);
+        assert_eq!(resumed.slice_state[1].search_after, Some(vec![json!("b")]));
+        assert!(resumed.slice_state[1].exhausted);
+        assert!(resumed.search_after.is_none());
+    }
+
+    #[test]
+    fn all_slices_done_marks_run_exhausted() {
+        let mut src = source(2);
+        src.slice_state = vec![
+            SliceState {
+                search_after: Some(vec![json!("a")]),
+                exhausted: true,
+            },
+            SliceState {
+                search_after: Some(vec![json!("b")]),
+                exhausted: true,
+            },
+        ];
+        let encoded = src.cursor().unwrap();
+
+        let mut resumed = source(2);
+        resumed.search_after = Some(encoded);
+        resumed.seed_cursors();
+        assert!(resumed.exhausted);
+    }
+
+    #[test]
+    fn slice_count_mismatch_starts_fresh() {
+        let mut src = source(2);
+        src.slice_state = vec![
+            SliceState {
+                search_after: Some(vec![json!("a")]),
+                exhausted: false,
+            },
+            SliceState::default(),
+        ];
+        let encoded = src.cursor().unwrap();
+
+        let mut resumed = source(3);
+        resumed.search_after = Some(encoded);
+        resumed.seed_cursors();
+        assert!(resumed
+            .slice_state
+            .iter()
+            .all(|s| s.search_after.is_none() && !s.exhausted));
+    }
+
+    #[test]
+    fn single_slice_discards_sliced_encoding() {
+        let mut src = source(2);
+        src.slice_state = vec![
+            SliceState {
+                search_after: Some(vec![json!("a")]),
+                exhausted: false,
+            },
+            SliceState::default(),
+        ];
+        let encoded = src.cursor().unwrap();
+
+        let mut single = source(1);
+        single.search_after = Some(encoded);
+        single.seed_cursors();
+        assert!(single.search_after.is_none());
+    }
+
+    #[test]
+    fn single_slice_keeps_normal_cursor() {
+        let mut single = source(1);
+        single.search_after = Some(vec![json!("doc-7")]);
+        single.seed_cursors();
+        // A plain single-slice cursor is preserved for resume.
+        assert_eq!(single.search_after, Some(vec![json!("doc-7")]));
     }
 }
 
