@@ -58,6 +58,20 @@ pub struct OpenSearchSource {
     exhausted: bool,
     flavor: ApiFlavor,
     slices: usize,
+    /// Per-slice extraction state, used only when `slices > 1`. Empty on the
+    /// single-slice path, which relies on `search_after`/`exhausted` instead.
+    slice_state: Vec<SliceState>,
+    /// Round-robin pointer into `slice_state` for the sliced path.
+    next_slice: usize,
+}
+
+/// Per-slice cursor for sliced PIT extraction. Each slice owns its own
+/// `search_after` cursor and exhaustion flag; the shared PIT id lives on the
+/// parent struct.
+#[derive(Debug, Clone, Default)]
+struct SliceState {
+    search_after: Option<Vec<Value>>,
+    exhausted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +122,8 @@ impl OpenSearchSource {
             exhausted: false,
             flavor: ApiFlavor::Unknown,
             slices: 1,
+            slice_state: Vec::new(),
+            next_slice: 0,
         })
     }
 
@@ -272,77 +288,26 @@ impl OpenSearchSource {
 
         Ok(())
     }
-}
 
-#[async_trait]
-impl Source for OpenSearchSource {
-    async fn open(&mut self) -> Result<()> {
-        info!("Opening PIT on index '{}'", self.index);
-
-        // Try OpenSearch path first: POST /{index}/_search/point_in_time?keep_alive=5m
-        let os_path = format!("/{}/_search/point_in_time?keep_alive=5m", self.index);
-
-        let resp = self
-            .execute_request(reqwest::Method::POST, &os_path, None)
-            .await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let body: Value = resp.json().await?;
-            let pit_id = body["pit_id"]
-                .as_str()
-                .ok_or_else(|| EsiftError::Source("PIT response missing 'pit_id'".into()))?
-                .to_string();
-            info!("PIT opened (OpenSearch)");
-            debug!("PIT id: {}", pit_id);
-            self.pit_id = Some(pit_id);
-            self.flavor = ApiFlavor::OpenSearch;
-            return Ok(());
+    /// Allocate one cursor per slice for the sliced path. Called from `open()`
+    /// once the PIT exists; a no-op when `slices <= 1`.
+    fn init_slice_state(&mut self) {
+        if self.slices > 1 {
+            self.slice_state = vec![SliceState::default(); self.slices];
+            self.next_slice = 0;
         }
-
-        // Fall back to Elasticsearch path: POST /{index}/_pit?keep_alive=5m
-        if status.as_u16() == 404 || status.as_u16() == 405 {
-            warn!(
-                "OpenSearch PIT path returned {}, trying Elasticsearch path",
-                status
-            );
-            let es_path = format!("/{}/_pit?keep_alive=5m", self.index);
-            let resp = self
-                .execute_request(reqwest::Method::POST, &es_path, None)
-                .await?;
-
-            if resp.status().is_success() {
-                let body: Value = resp.json().await?;
-                let pit_id = body["id"]
-                    .as_str()
-                    .ok_or_else(|| EsiftError::Source("PIT response missing 'id'".into()))?
-                    .to_string();
-                info!("PIT opened (Elasticsearch)");
-                self.pit_id = Some(pit_id);
-                self.flavor = ApiFlavor::Elasticsearch;
-                return Ok(());
-            }
-
-            let s = resp.status();
-            let body = response_body(resp).await;
-            return Err(EsiftError::Source(format!(
-                "PIT open failed (ES fallback): HTTP {} — {}",
-                s, body
-            )));
-        }
-
-        let body = response_body(resp).await;
-        Err(EsiftError::Source(format!(
-            "PIT open failed: HTTP {} — {}",
-            status, body
-        )))
     }
 
-    async fn next_batch(&mut self) -> Result<Option<Vec<Document>>> {
-        if self.exhausted {
-            return Ok(None);
-        }
-
+    /// Issue one `_search` against the shared PIT. `slice` carries the
+    /// `{id, max}` pair for sliced extraction, or `None` for the single-slice
+    /// path. `search_after` seeds the per-request cursor. Returns the parsed
+    /// documents and the next cursor (last hit's `sort`), or `None` when the
+    /// page is empty. Rotates the PIT id from the response when present.
+    async fn search_one(
+        &mut self,
+        slice: Option<usize>,
+        search_after: Option<&Vec<Value>>,
+    ) -> Result<Option<(Vec<Document>, Option<Vec<Value>>)>> {
         let pit_id = self
             .pit_id
             .as_ref()
@@ -362,7 +327,11 @@ impl Source for OpenSearchSource {
             "track_total_hits": false
         });
 
-        if let Some(ref cursor) = self.search_after {
+        if let Some(id) = slice {
+            body["slice"] = json!({ "id": id, "max": self.slices });
+        }
+
+        if let Some(cursor) = search_after {
             body["search_after"] = Value::Array(cursor.clone());
         }
 
@@ -391,19 +360,12 @@ impl Source for OpenSearchSource {
             .ok_or_else(|| EsiftError::Source("Response missing hits.hits".into()))?;
 
         if hits.is_empty() {
-            self.exhausted = true;
             return Ok(None);
         }
 
-        if hits.len() < self.batch_size {
-            self.exhausted = true;
-        }
-
-        if let Some(last) = hits.last() {
-            if let Some(sort_vals) = last["sort"].as_array() {
-                self.search_after = Some(sort_vals.clone());
-            }
-        }
+        let next_cursor = hits
+            .last()
+            .and_then(|last| last["sort"].as_array().cloned());
 
         let index = self.index.clone();
         let docs: Vec<Document> = hits
@@ -416,8 +378,148 @@ impl Source for OpenSearchSource {
             })
             .collect();
 
-        debug!("Fetched {} documents", docs.len());
-        Ok(Some(docs))
+        Ok(Some((docs, next_cursor)))
+    }
+
+    /// Single-slice extraction: one PIT, one `search_after` cursor. Preserves
+    /// the original behavior, including the `hits.len() < batch_size` early
+    /// exhaustion and resume-cursor seeding.
+    async fn next_batch_single(&mut self) -> Result<Option<Vec<Document>>> {
+        let cursor = self.search_after.clone();
+        match self.search_one(None, cursor.as_ref()).await? {
+            None => {
+                self.exhausted = true;
+                Ok(None)
+            }
+            Some((docs, next_cursor)) => {
+                if docs.len() < self.batch_size {
+                    self.exhausted = true;
+                }
+                if let Some(next) = next_cursor {
+                    self.search_after = Some(next);
+                }
+                debug!("Fetched {} documents", docs.len());
+                Ok(Some(docs))
+            }
+        }
+    }
+
+    /// Sliced extraction: one shared PIT, one `search_after` cursor per slice.
+    /// Advances slices round-robin, skipping exhausted ones, and is exhausted
+    /// only once every slice has drained. A single checkpoint cursor cannot
+    /// represent N slice cursors, so `cursor()` returns `None` here and a
+    /// mid-run resume is not available with `slices > 1`.
+    async fn next_batch_sliced(&mut self) -> Result<Option<Vec<Document>>> {
+        let count = self.slice_state.len();
+        for _ in 0..count {
+            let idx = self.next_slice;
+            self.next_slice = (self.next_slice + 1) % count;
+
+            if self.slice_state[idx].exhausted {
+                continue;
+            }
+
+            let cursor = self.slice_state[idx].search_after.clone();
+            match self.search_one(Some(idx), cursor.as_ref()).await? {
+                None => {
+                    self.slice_state[idx].exhausted = true;
+                    continue;
+                }
+                Some((docs, next_cursor)) => {
+                    if docs.len() < self.batch_size {
+                        self.slice_state[idx].exhausted = true;
+                    }
+                    if let Some(next) = next_cursor {
+                        self.slice_state[idx].search_after = Some(next);
+                    }
+                    debug!("Fetched {} documents from slice {}", docs.len(), idx);
+                    return Ok(Some(docs));
+                }
+            }
+        }
+
+        // Every slice drained.
+        self.exhausted = true;
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl Source for OpenSearchSource {
+    async fn open(&mut self) -> Result<()> {
+        info!("Opening PIT on index '{}'", self.index);
+
+        // Try OpenSearch path first: POST /{index}/_search/point_in_time?keep_alive=5m
+        let os_path = format!("/{}/_search/point_in_time?keep_alive=5m", self.index);
+
+        let resp = self
+            .execute_request(reqwest::Method::POST, &os_path, None)
+            .await?;
+        let status = resp.status();
+
+        if status.is_success() {
+            let body: Value = resp.json().await?;
+            let pit_id = body["pit_id"]
+                .as_str()
+                .ok_or_else(|| EsiftError::Source("PIT response missing 'pit_id'".into()))?
+                .to_string();
+            info!("PIT opened (OpenSearch)");
+            debug!("PIT id: {}", pit_id);
+            self.pit_id = Some(pit_id);
+            self.flavor = ApiFlavor::OpenSearch;
+            self.init_slice_state();
+            return Ok(());
+        }
+
+        // Fall back to Elasticsearch path: POST /{index}/_pit?keep_alive=5m
+        if status.as_u16() == 404 || status.as_u16() == 405 {
+            warn!(
+                "OpenSearch PIT path returned {}, trying Elasticsearch path",
+                status
+            );
+            let es_path = format!("/{}/_pit?keep_alive=5m", self.index);
+            let resp = self
+                .execute_request(reqwest::Method::POST, &es_path, None)
+                .await?;
+
+            if resp.status().is_success() {
+                let body: Value = resp.json().await?;
+                let pit_id = body["id"]
+                    .as_str()
+                    .ok_or_else(|| EsiftError::Source("PIT response missing 'id'".into()))?
+                    .to_string();
+                info!("PIT opened (Elasticsearch)");
+                self.pit_id = Some(pit_id);
+                self.flavor = ApiFlavor::Elasticsearch;
+                self.init_slice_state();
+                return Ok(());
+            }
+
+            let s = resp.status();
+            let body = response_body(resp).await;
+            return Err(EsiftError::Source(format!(
+                "PIT open failed (ES fallback): HTTP {} — {}",
+                s, body
+            )));
+        }
+
+        let body = response_body(resp).await;
+        Err(EsiftError::Source(format!(
+            "PIT open failed: HTTP {} — {}",
+            status, body
+        )))
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<Vec<Document>>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        if self.slices > 1 {
+            self.next_batch_sliced().await
+        } else {
+            self.next_batch_single().await
+        }
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -457,6 +559,14 @@ impl Source for OpenSearchSource {
     }
 
     fn cursor(&self) -> Option<Vec<Value>> {
+        // Sliced extraction keeps one `search_after` cursor per slice, which a
+        // single checkpoint value cannot represent. Return `None` so the
+        // checkpoint layer does not record a partial cursor; mid-run resume is
+        // unavailable when `slices > 1`. Resume seeding (`resume_after`) applies
+        // only to the single-slice path.
+        if self.slices > 1 {
+            return None;
+        }
         self.search_after.clone()
     }
 }
