@@ -14,6 +14,10 @@ aws = [
     "dep:http",
 ]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+# Datadog archive source (Path 1): S3 object listing/download + zstd decode.
+datadog-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:zstd"]
+# Datadog Logs Search API source (Path 2): no extra deps (reqwest already present).
+datadog-api = []
 
 [dependencies]
 tokio.workspace = true
@@ -34,6 +38,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
 ], optional = true }
 http = { workspace = true, optional = true }
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -11,6 +11,34 @@ batch_size = 500
 # query = '{"range": {"@timestamp": {"gte": "2025-01-01", "lte": "2025-06-01"}}}'
 query = '{"match_all": {}}'
 
+# ---------------------------------------------------------------------------
+# Datadog Archive source (Path 1) — reads compressed-JSON log archives from S3.
+# Build with: cargo build --release --features datadog-s3
+# ---------------------------------------------------------------------------
+# [source]
+# kind           = "datadog-archive"
+# dd_bucket      = "my-log-archive-bucket"
+# dd_prefix      = "datadog/logs"        # prefix Datadog writes under (no trailing slash)
+# dd_region      = "us-east-1"
+# dd_compression = "zstd"                # "zstd" (default) or "gzip"
+# dd_from        = "2025-01-01T00:00:00Z"
+# dd_to          = "2025-02-01T00:00:00Z"
+
+# ---------------------------------------------------------------------------
+# Datadog API source (Path 2) — live-retention window via the Logs Search API.
+# Build with: cargo build --release --features datadog-api
+# Secret values support env: and file: indirection (see crates/esift-cli/src/secret.rs).
+# ---------------------------------------------------------------------------
+# [source]
+# kind              = "datadog-api"
+# dd_site           = "datadoghq.com"    # datadoghq.com | datadoghq.eu | us3/us5/ap1.datadoghq.com
+# dd_api_key        = "env:DD_API_KEY"   # or "file:/run/secrets/dd_api_key"
+# dd_app_key        = "env:DD_APP_KEY"   # or "file:/run/secrets/dd_app_key"
+# dd_query          = "service:my-app status:error"
+# dd_from           = "2025-06-01T00:00:00Z"
+# dd_to             = "2025-06-15T00:00:00Z"
+# dd_window_minutes = 60                 # chunk [from,to] into N-minute windows
+
 [destination]
 type = "openobserve"
 url = "http://localhost:5080"

@@ -1,0 +1,36 @@
+# LocalStack — local AWS S3 emulator for the Datadog archive end-to-end test.
+#
+# Brings up a single LocalStack container exposing the S3 service on the
+# standard edge port 4566. The Datadog archive E2E test
+# (`crates/esift-core/tests/datadog_archive_e2e.rs`) points the aws-sdk-s3
+# client at `http://localhost:4566` with dummy credentials and path-style
+# addressing, seeds Datadog-style archive objects into a bucket, and runs the
+# archive source to completion.
+#
+# Usage:
+#   docker compose -f docker/localstack.yml up -d      # start
+#   cargo test -p esift-core --features datadog-s3 -- --ignored   # run the E2E
+#   docker compose -f docker/localstack.yml down        # stop + clean up
+#
+# Nothing here is required for the normal build or for `--no-run`; it only
+# matters when actually executing the (ignored) integration test.
+
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      # Edge port: every emulated AWS service (S3 included) is served here.
+      - "4566:4566"
+    environment:
+      # Restrict the emulator to just S3 — faster startup, smaller footprint.
+      - SERVICES=s3
+      # S3 only; no real AWS account is contacted. These match the dummy
+      # credentials the test sends, but LocalStack does not validate them.
+      - DEBUG=0
+    healthcheck:
+      # LocalStack exposes a health endpoint listing each service's state;
+      # treat the container as ready once it responds.
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
