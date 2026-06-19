@@ -13,6 +13,7 @@ aws = [
     "dep:aws-smithy-runtime-api",
     "dep:http",
 ]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 
 [dependencies]
 tokio.workspace = true
@@ -28,6 +29,10 @@ aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
 aws-sigv4 = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
