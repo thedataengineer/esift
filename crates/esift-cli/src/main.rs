@@ -2,13 +2,16 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use esift_core::{
     checkpoint::CheckpointManager,
-    config::{DestConfig, EsiftConfig},
+    config::{DestConfig, EsiftConfig, SourceConfig},
     dest::{
+        file::FileDestination,
         openobserve::{OpenObserveDestination, OpenObserveOptions},
+        s3::S3Destination,
         stdout::StdoutDestination,
         Destination,
     },
     source::{
+        file::FileSource,
         opensearch::{Auth, OpenSearchSource},
         Source,
     },
@@ -16,8 +19,11 @@ use esift_core::{
 use esift_transform::mapping::Transformer;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info};
 
+mod metrics;
+mod metrics_server;
 mod secret;
 
 #[derive(Parser)]
@@ -88,6 +94,14 @@ enum Commands {
         /// Source password (for basic auth)
         #[arg(long, env = "ESIFT_SOURCE_PASSWORD")]
         source_password: Option<String>,
+
+        /// Parallel extraction slices (sliced PIT)
+        #[arg(long, default_value = "1")]
+        slices: usize,
+
+        /// Serve Prometheus metrics on this address, e.g. 127.0.0.1:9090
+        #[arg(long)]
+        metrics_addr: Option<String>,
     },
 }
 
@@ -124,6 +138,8 @@ async fn main() -> Result<()> {
             source_aws_region,
             source_username,
             source_password,
+            slices,
+            metrics_addr,
         } => {
             let query_value: serde_json::Value = serde_json::from_str(&query)?;
 
@@ -145,7 +161,8 @@ async fn main() -> Result<()> {
                 batch_size,
                 auth,
                 checkpoint_mgr.state.search_after.clone(),
-            )?;
+            )?
+            .with_slices(slices);
 
             let mut destination: Box<dyn Destination> = match dest.as_str() {
                 "stdout" => Box::new(StdoutDestination),
@@ -177,12 +194,14 @@ async fn main() -> Result<()> {
             };
 
             let transformer = Transformer::identity();
+            let metrics = start_metrics(metrics_addr);
 
             run_extraction(
                 &mut source,
                 &mut *destination,
                 &transformer,
                 &mut checkpoint_mgr,
+                &metrics,
             )
             .await?;
         }
@@ -192,30 +211,18 @@ async fn main() -> Result<()> {
 }
 
 async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
-    let query: serde_json::Value = serde_json::from_str(&cfg.source.query)?;
-
-    let source_password = secret::resolve_opt(cfg.source.password)?;
-    let auth = resolve_auth(
-        cfg.source.auth_type.as_deref(),
-        cfg.source.username,
-        source_password,
-        cfg.source.aws_region,
-    )
-    .await?;
-
     let mut checkpoint_mgr = CheckpointManager::new(cfg.checkpoint_path)?;
 
-    let mut source = OpenSearchSource::new(
-        &cfg.source.url,
-        &cfg.source.index,
-        query,
-        cfg.source.batch_size,
-        auth,
-        checkpoint_mgr.state.search_after.clone(),
-    )?;
+    let mut source = build_source(&cfg.source, checkpoint_mgr.state.search_after.clone()).await?;
 
     let mut destination: Box<dyn Destination> = match cfg.destination {
         DestConfig::Stdout => Box::new(StdoutDestination),
+        DestConfig::File { path } => Box::new(FileDestination::new(path)?),
+        DestConfig::S3 {
+            bucket,
+            prefix,
+            region,
+        } => Box::new(S3Destination::new(bucket, prefix, region)?),
         DestConfig::OpenObserve {
             url,
             org,
@@ -233,15 +240,73 @@ async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
         }
     };
 
-    let transformer = Transformer::identity();
+    let transformer = Transformer::new(cfg.transforms);
+    let metrics = start_metrics(cfg.metrics_addr);
 
     run_extraction(
-        &mut source,
+        &mut *source,
         &mut *destination,
         &transformer,
         &mut checkpoint_mgr,
+        &metrics,
     )
     .await
+}
+
+/// Build the configured source (opensearch or file).
+async fn build_source(
+    cfg: &SourceConfig,
+    resume_after: Option<Vec<serde_json::Value>>,
+) -> Result<Box<dyn Source>> {
+    match cfg.kind.as_str() {
+        "file" => {
+            let path = cfg
+                .path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("source.path is required for the file source"))?;
+            Ok(Box::new(FileSource::new(path)?))
+        }
+        "opensearch" | "" => {
+            if cfg.url.is_empty() || cfg.index.is_empty() {
+                anyhow::bail!("source.url and source.index are required for the opensearch source");
+            }
+            let query: serde_json::Value = serde_json::from_str(&cfg.query)?;
+            let password = secret::resolve_opt(cfg.password.clone())?;
+            let auth = resolve_auth(
+                cfg.auth_type.as_deref(),
+                cfg.username.clone(),
+                password,
+                cfg.aws_region.clone(),
+            )
+            .await?;
+            let source = OpenSearchSource::new(
+                &cfg.url,
+                &cfg.index,
+                query,
+                cfg.batch_size,
+                auth,
+                resume_after,
+            )?
+            .with_slices(cfg.slices);
+            Ok(Box::new(source))
+        }
+        other => anyhow::bail!("unknown source kind '{}'", other),
+    }
+}
+
+/// Build the shared metrics handle and, when an address is set, start the
+/// metrics endpoint in the background.
+fn start_metrics(addr: Option<String>) -> metrics::SharedMetrics {
+    let handle: metrics::SharedMetrics = Arc::new(metrics::Metrics::default());
+    if let Some(addr) = addr {
+        let m = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::serve(addr, m).await {
+                error!("metrics server error: {e}");
+            }
+        });
+    }
+    handle
 }
 
 async fn run_extraction(
@@ -249,6 +314,7 @@ async fn run_extraction(
     dest: &mut dyn Destination,
     transformer: &Transformer,
     checkpoint: &mut CheckpointManager,
+    metrics: &metrics::SharedMetrics,
 ) -> Result<()> {
     info!("Source:      {}", source.description());
     info!("Destination: {}", dest.description());
@@ -274,10 +340,12 @@ async fn run_extraction(
                         checkpoint.state.record_batch(written, source.cursor());
                         checkpoint.save()?;
                         total += written as u64;
+                        metrics.record_batch(written as u64);
                         progress.set_message(format!("{} documents extracted", total));
                     }
                     Err(e) => {
                         error!("Write failed: {}", e);
+                        metrics.record_error();
                         source.close().await?;
                         return Err(e.into());
                     }
@@ -289,6 +357,7 @@ async fn run_extraction(
             }
             Err(e) => {
                 error!("Source error: {}", e);
+                metrics.record_error();
                 source.close().await?;
                 return Err(e.into());
             }

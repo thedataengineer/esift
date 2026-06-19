@@ -9,15 +9,9 @@
 //!   set_timestamp — copy a field value into _timestamp (OpenObserve's expected field)
 
 use esift_core::Document;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Transform {
-    Rename { from: String, to: String },
-    Drop { field: String },
-    SetTimestamp { from: String },
-}
+// Re-export so existing `esift_transform::mapping::Transform` paths keep working.
+pub use esift_core::transform::Transform;
 
 pub struct Transformer {
     transforms: Vec<Transform>,
