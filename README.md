@@ -139,6 +139,66 @@ cargo run -- extract --source-url http://localhost:9200 --source-index test-logs
 
 ---
 
+## Datadog source
+
+esift can extract log events directly from Datadog using two paths. Build with the matching feature flag:
+
+```bash
+cargo build --release --features datadog-s3   # Archive source (Path 1)
+cargo build --release --features datadog-api  # API source (Path 2)
+```
+
+### datadog-archive (Path 1)
+
+Reads the compressed-JSON archive files that Datadog writes to your S3 bucket via Log Archives. No rate limits, unlimited history, file-level resume.
+
+```toml
+[source]
+kind = "datadog-archive"
+dd_bucket      = "my-log-archive-bucket"
+dd_prefix      = "datadog/logs"
+dd_region      = "us-east-1"
+dd_compression = "zstd"          # zstd (default) or gzip
+dd_from        = "2025-01-01T00:00:00Z"
+dd_to          = "2025-02-01T00:00:00Z"
+```
+
+### datadog-api (Path 2)
+
+Calls `POST /api/v2/logs/events/search`, chunked into time windows and cursor-paginated. Limited to Datadog's live retention window (typically 15 days).
+
+```toml
+[source]
+kind              = "datadog-api"
+dd_site           = "datadoghq.com"
+dd_api_key        = "env:DD_API_KEY"
+dd_app_key        = "env:DD_APP_KEY"
+dd_query          = "service:my-app status:error"
+dd_from           = "2025-06-01T00:00:00Z"
+dd_to             = "2025-06-15T00:00:00Z"
+dd_window_minutes = 60
+```
+
+### Datadog config fields
+
+| Field | Source kind | Description |
+|---|---|---|
+| `dd_bucket` | `datadog-archive` | S3 bucket name where Datadog writes archive files |
+| `dd_prefix` | `datadog-archive` | Key prefix within the bucket |
+| `dd_region` | `datadog-archive` | AWS region of the bucket |
+| `dd_compression` | `datadog-archive` | Codec: `zstd` (default) or `gzip` |
+| `dd_site` | `datadog-api` | Regional site: `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com` |
+| `dd_api_key` | `datadog-api` | Datadog API key — literal, `env:VAR`, or `file:PATH` |
+| `dd_app_key` | `datadog-api` | Datadog Application key — literal, `env:VAR`, or `file:PATH` |
+| `dd_query` | `datadog-api` | Datadog log search query (default: all logs) |
+| `dd_from` | both | Start of time range (RFC 3339) |
+| `dd_to` | both | End of time range (RFC 3339) |
+| `dd_window_minutes` | `datadog-api` | Time-window chunk size in minutes (default: `60`) |
+
+See [DATADOG.md](DATADOG.md) for a full guide including path comparison, regional sites, secret references, and troubleshooting.
+
+---
+
 ## Destinations
 
 | `--dest` | Description |
@@ -157,6 +217,8 @@ Planned: S3/Parquet, ClickHouse, local NDJSON file.
 | OpenSearch 2.4+ | Tested |
 | Elasticsearch 7.10+ | Supported (auto-detected) |
 | AWS OpenSearch Service | Supported (basic auth, IAM/SigV4 auth, or open access domains) |
+| Datadog Log Archives (S3) | Supported (`--features datadog-s3`) |
+| Datadog Logs API | Supported (`--features datadog-api`) |
 
 ---
 
