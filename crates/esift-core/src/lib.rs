@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod dest;
 pub mod error;
+pub mod http;
 pub mod source;
 
 /// A single document extracted from a source.

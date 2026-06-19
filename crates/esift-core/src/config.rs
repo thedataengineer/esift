@@ -32,6 +32,8 @@ pub enum DestConfig {
         stream: String,
         username: String,
         password: String,
+        #[serde(default)]
+        options: Box<crate::dest::openobserve::OpenObserveOptions>,
     },
     Stdout,
 }

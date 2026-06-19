@@ -1,7 +1,10 @@
 //! Integration tests for the OpenObserve destination's _bulk ingest path,
 //! driven against a wiremock HTTP server.
 
-use esift_core::dest::{openobserve::OpenObserveDestination, Destination};
+use esift_core::dest::{
+    openobserve::{OpenObserveDestination, OpenObserveOptions},
+    Destination,
+};
 use esift_core::Document;
 use serde_json::json;
 use wiremock::matchers::{header, method, path};
@@ -18,8 +21,15 @@ async fn bulk_returns_accepted_count_on_success() {
         .mount(&server)
         .await;
 
-    let mut dest =
-        OpenObserveDestination::new(server.uri(), "default", "mystream", "user", "pass").unwrap();
+    let mut dest = OpenObserveDestination::new(
+        server.uri(),
+        "default",
+        "mystream",
+        "user",
+        "pass",
+        OpenObserveOptions::default(),
+    )
+    .unwrap();
 
     let written = dest
         .write_batch(vec![
@@ -42,8 +52,15 @@ async fn bulk_error_propagates_status_and_body() {
         .mount(&server)
         .await;
 
-    let mut dest =
-        OpenObserveDestination::new(server.uri(), "default", "mystream", "user", "pass").unwrap();
+    let mut dest = OpenObserveDestination::new(
+        server.uri(),
+        "default",
+        "mystream",
+        "user",
+        "pass",
+        OpenObserveOptions::default(),
+    )
+    .unwrap();
 
     let err = dest
         .write_batch(vec![Document::new("logs", "1", json!({ "a": 1 }))])
@@ -60,7 +77,14 @@ async fn bulk_error_propagates_status_and_body() {
 #[tokio::test]
 async fn empty_batch_is_a_noop() {
     // No server required: an empty batch short-circuits before any request.
-    let mut dest =
-        OpenObserveDestination::new("http://unused.invalid", "default", "s", "u", "p").unwrap();
+    let mut dest = OpenObserveDestination::new(
+        "http://unused.invalid",
+        "default",
+        "s",
+        "u",
+        "p",
+        OpenObserveOptions::default(),
+    )
+    .unwrap();
     assert_eq!(dest.write_batch(vec![]).await.unwrap(), 0);
 }
