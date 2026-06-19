@@ -48,3 +48,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all --all-features
+
+  lean:
+    name: Lean build (Datadog feature matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Default features — check esift-core
+        run: cargo check -p esift-core
+      - name: Default features — assert no Datadog-only deps
+        run: "! cargo tree -e no-dev | grep -E 'zstd|aws-sdk-s3'"
+      - name: Feature datadog-s3
+        run: cargo check --features datadog-s3
+      - name: Feature datadog-api
+        run: cargo check --features datadog-api
+      - name: Features datadog-s3,datadog-api
+        run: cargo check --features datadog-s3,datadog-api
