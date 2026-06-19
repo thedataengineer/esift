@@ -3,7 +3,11 @@ use clap::{Parser, Subcommand};
 use esift_core::{
     checkpoint::CheckpointManager,
     config::{DestConfig, EsiftConfig},
-    dest::{openobserve::OpenObserveDestination, stdout::StdoutDestination, Destination},
+    dest::{
+        openobserve::{OpenObserveDestination, OpenObserveOptions},
+        stdout::StdoutDestination,
+        Destination,
+    },
     source::{
         opensearch::{Auth, OpenSearchSource},
         Source,
@@ -154,7 +158,12 @@ async fn main() -> Result<()> {
                         anyhow::anyhow!("--dest-password required for openobserve")
                     })?;
                     Box::new(OpenObserveDestination::new(
-                        url, dest_org, stream, username, password,
+                        url,
+                        dest_org,
+                        stream,
+                        username,
+                        password,
+                        OpenObserveOptions::default(),
                     )?)
                 }
                 other => anyhow::bail!(
@@ -208,8 +217,9 @@ async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
             stream,
             username,
             password,
+            options,
         } => Box::new(OpenObserveDestination::new(
-            url, org, stream, username, password,
+            url, org, stream, username, password, *options,
         )?),
     };
 

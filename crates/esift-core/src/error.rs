@@ -8,6 +8,9 @@ pub enum EsiftError {
     #[error("Destination error: {0}")]
     Destination(String),
 
+    #[error("Transient error: {0}")]
+    Transient(String),
+
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
