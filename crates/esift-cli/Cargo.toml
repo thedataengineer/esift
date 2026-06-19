@@ -15,6 +15,7 @@ aws = [
     "dep:aws-config",
     "dep:aws-credential-types",
 ]
+s3 = ["esift-core/s3"]
 
 [dependencies]
 tokio.workspace = true
