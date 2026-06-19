@@ -8,8 +8,8 @@ The sink is structured as independent seams under `crates/esift-core/src/dest/op
 
 | Item | Seam | Status |
 |---|---|---|
-| Bulk partial-failure accounting | `response.rs` | Planned |
-| Retry with backoff on 429 / 5xx | `http/retry.rs` | Planned |
+| Bulk partial-failure accounting | `response.rs` | Done |
+| Retry with backoff on 429 / 5xx | `http/retry.rs` | Done |
 
 Partial-failure accounting is the priority. Before this work the sink returned the submitted document count and only logged when OpenObserve set `errors:true`, so rejected documents were counted as written and the checkpoint advanced past them. That is silent data loss: a run can report a clean migration while dropping documents the server refused. The fix parses the `items[]` array, counts real successes, and routes rejects to the dead-letter sink.
 
@@ -17,20 +17,21 @@ Partial-failure accounting is the priority. Before this work the sink returned t
 
 | Item | Seam | Status |
 |---|---|---|
-| gzip request compression | `transport.rs` | Planned |
-| Byte-size batch cap | `build.rs` | Planned |
-| Concurrent in-flight requests | `pipeline.rs` | Planned |
-| Per-document stream routing | `routing.rs` | Planned |
-| `_timestamp` derivation | `timestamp.rs` | Planned |
+| gzip request compression | `transport.rs` | Done |
+| Byte-size batch cap | `build.rs` | Done |
+| Concurrent in-flight requests | `pipeline.rs` | Done |
+| Per-document stream routing | `routing.rs` | Done |
+| `_timestamp` derivation | `timestamp.rs` | Done |
 
 ## P2 — operations and security
 
 | Item | Seam | Status |
 |---|---|---|
-| Token auth + secret sourcing (env/file) | `auth.rs` | Planned |
-| TLS controls (custom CA, mTLS, insecure) | `tls.rs` | Planned |
-| Dead-letter sink for rejected docs | `deadletter.rs` | Planned |
-| Throughput / reject metrics | `metrics.rs` | Planned |
+| Token auth | `auth.rs` | Done |
+| Secret sourcing (`env:` / `file:`) | cli `secret.rs` | Done |
+| TLS controls (custom CA, mTLS, insecure) | `tls.rs` | Done |
+| Dead-letter sink for rejected docs | `deadletter.rs` | Done |
+| Throughput / reject metrics | `metrics.rs` | Done |
 
 ## Configuration
 
