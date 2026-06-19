@@ -35,9 +35,9 @@ pub struct DatadogArchiveSource {
     // ignores them, so the field is intentionally unused there.
     #[cfg_attr(not(feature = "datadog-s3"), allow(dead_code))]
     region: Option<String>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "datadog-s3"), allow(dead_code))]
     from: Option<String>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "datadog-s3"), allow(dead_code))]
     to: Option<String>,
     #[cfg_attr(not(feature = "datadog-s3"), allow(dead_code))]
     compression: Compression,
@@ -218,6 +218,47 @@ impl DatadogArchiveSource {
         Ok(all)
     }
 
+    /// Extract the `(year, month, day, hour)` hour bucket from an archive key.
+    ///
+    /// Datadog lays keys out as `{prefix}/YYYY/MM/DD/HH/MM_hash.json.zst`. We
+    /// strip `self.prefix`, split the remainder on `/`, and parse the first four
+    /// segments as zero-padded numbers (widths 4,2,2,2). Returns `None` if the
+    /// remainder doesn't have that shape, so callers can treat such keys
+    /// conservatively (never silently dropped).
+    fn key_hour_bucket(&self, key: &str) -> Option<(u32, u32, u32, u32)> {
+        let rest = key.strip_prefix(&self.prefix)?;
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        let mut segs = rest.split('/');
+        let y = segs.next()?;
+        let mo = segs.next()?;
+        let d = segs.next()?;
+        let h = segs.next()?;
+        if y.len() != 4 || mo.len() != 2 || d.len() != 2 || h.len() != 2 {
+            return None;
+        }
+        Some((
+            y.parse().ok()?,
+            mo.parse().ok()?,
+            d.parse().ok()?,
+            h.parse().ok()?,
+        ))
+    }
+
+    /// Parse an ISO8601 timestamp (e.g. `2025-01-01T00:00:00Z`) into the same
+    /// `(year, month, day, hour)` hour bucket by slicing fixed positions.
+    /// Returns `None` if the string is too short or any field isn't numeric.
+    fn iso_hour_bucket(ts: &str) -> Option<(u32, u32, u32, u32)> {
+        if ts.len() < 13 {
+            return None;
+        }
+        Some((
+            ts.get(0..4)?.parse().ok()?,
+            ts.get(5..7)?.parse().ok()?,
+            ts.get(8..10)?.parse().ok()?,
+            ts.get(11..13)?.parse().ok()?,
+        ))
+    }
+
     /// List + sort + apply resume, populating `self.state`.
     async fn open_with_store(&mut self, store: &dyn ObjectStore) -> Result<()> {
         let mut keys = store.list(&self.prefix).await?;
@@ -226,6 +267,24 @@ impl DatadogArchiveSource {
         let (last_key, files_done) = self.decode_resume();
         if let Some(anchor) = &last_key {
             keys.retain(|k| k > anchor);
+        }
+
+        // Hour-granularity time-range filtering on `from`/`to`. A key is kept
+        // when its hour bucket is `>= from`'s bucket (if set) AND `<= to`'s
+        // bucket (if set). Because comparison is at hour granularity, the
+        // boundary hours containing `from` and `to` are fully included (every
+        // minute file in that hour passes). Keys whose date can't be parsed are
+        // kept unconditionally — we never silently drop an object we can't
+        // classify.
+        let from_bucket = self.from.as_deref().and_then(Self::iso_hour_bucket);
+        let to_bucket = self.to.as_deref().and_then(Self::iso_hour_bucket);
+        if from_bucket.is_some() || to_bucket.is_some() {
+            keys.retain(|k| match self.key_hour_bucket(k) {
+                None => true,
+                Some(bucket) => {
+                    from_bucket.is_none_or(|f| bucket >= f) && to_bucket.is_none_or(|t| bucket <= t)
+                }
+            });
         }
 
         self.state = ArchiveState {
@@ -511,6 +570,91 @@ mod tests {
         let second = src.next_batch_with_store(&store).await.unwrap().unwrap();
         assert_eq!(second.len(), 1); // file 2
         assert!(src.next_batch_with_store(&store).await.unwrap().is_none());
+    }
+
+    /// One gzip NDJSON file per hour bucket 00..=02 under prefix `dd/` (which
+    /// does NOT include the date path, so the YYYY/MM/DD/HH segments survive the
+    /// prefix strip), plus one key with an unparseable date segment.
+    fn seed_hourly_store() -> FakeStore {
+        let mut objects = BTreeMap::new();
+        objects.insert(
+            "dd/2026/06/19/00/00_h0.json.gz".to_string(),
+            gzip("{\"host\":\"h0\"}\n"),
+        );
+        objects.insert(
+            "dd/2026/06/19/01/00_h1.json.gz".to_string(),
+            gzip("{\"host\":\"h1\"}\n"),
+        );
+        objects.insert(
+            "dd/2026/06/19/02/00_h2.json.gz".to_string(),
+            gzip("{\"host\":\"h2\"}\n"),
+        );
+        // Unparseable date shape (no YYYY/MM/DD/HH): must always be kept.
+        objects.insert(
+            "dd/2026/06/19/weird/00_x.json.gz".to_string(),
+            gzip("{\"host\":\"hx\"}\n"),
+        );
+        FakeStore { objects }
+    }
+
+    fn new_source_with_range(from: Option<&str>, to: Option<&str>) -> DatadogArchiveSource {
+        DatadogArchiveSource::new(
+            "my-bucket",
+            "dd/",
+            None,
+            from.map(|s| s.to_string()),
+            to.map(|s| s.to_string()),
+            Compression::Auto,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn host_of(doc: &Document) -> String {
+        doc.body["host"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn from_filters_out_earlier_hours() {
+        let store = seed_hourly_store();
+        // Lower bound at hour 01: drop hour 00, keep 01, 02, and the unparseable.
+        let mut src = new_source_with_range(Some("2026-06-19T01:30:00Z"), None);
+        let docs = src.run_with_store(&store).await.unwrap();
+        let hosts: Vec<String> = docs.iter().map(host_of).collect();
+        assert_eq!(hosts, vec!["h1", "h2", "hx"]);
+    }
+
+    #[tokio::test]
+    async fn to_filters_out_later_hours() {
+        let store = seed_hourly_store();
+        // Upper bound at hour 01: keep 00, 01, and the unparseable; drop 02.
+        let mut src = new_source_with_range(None, Some("2026-06-19T01:15:00Z"));
+        let docs = src.run_with_store(&store).await.unwrap();
+        let hosts: Vec<String> = docs.iter().map(host_of).collect();
+        assert_eq!(hosts, vec!["h0", "h1", "hx"]);
+    }
+
+    #[tokio::test]
+    async fn from_and_to_bound_a_single_hour() {
+        let store = seed_hourly_store();
+        // Both bounds inside hour 01: only hour 01 plus the unparseable remain.
+        let mut src =
+            new_source_with_range(Some("2026-06-19T01:00:00Z"), Some("2026-06-19T01:59:59Z"));
+        let docs = src.run_with_store(&store).await.unwrap();
+        let hosts: Vec<String> = docs.iter().map(host_of).collect();
+        assert_eq!(hosts, vec!["h1", "hx"]);
+    }
+
+    #[tokio::test]
+    async fn unparseable_date_key_is_kept() {
+        let store = seed_hourly_store();
+        // A tight range that excludes every parseable hour still keeps the
+        // key whose date can't be parsed (conservative: never silently drop).
+        let mut src =
+            new_source_with_range(Some("2026-06-20T00:00:00Z"), Some("2026-06-20T23:00:00Z"));
+        let docs = src.run_with_store(&store).await.unwrap();
+        let hosts: Vec<String> = docs.iter().map(host_of).collect();
+        assert_eq!(hosts, vec!["hx"]);
     }
 
     #[tokio::test]
