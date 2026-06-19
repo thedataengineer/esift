@@ -1,7 +1,7 @@
 //! Apply authentication to an outgoing bulk request.
 //!
-//! Foundation stub: HTTP basic auth, as before. Lane 8 adds token-header auth
-//! (used when `options.token` is set) and sources secrets from env/file.
+//! When `options.token` is set, the request carries a bearer token; otherwise
+//! it falls back to HTTP basic auth with the configured username/password.
 
 use super::SinkContext;
 
@@ -10,5 +10,8 @@ pub(crate) fn apply(
     builder: reqwest::RequestBuilder,
     ctx: &SinkContext,
 ) -> reqwest::RequestBuilder {
-    builder.basic_auth(&ctx.username, Some(&ctx.password))
+    match &ctx.options.token {
+        Some(token) => builder.bearer_auth(token),
+        None => builder.basic_auth(&ctx.username, Some(&ctx.password)),
+    }
 }
