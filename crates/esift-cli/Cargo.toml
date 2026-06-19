@@ -17,6 +17,8 @@ aws = [
 ]
 s3 = ["esift-core/s3"]
 datadog-s3 = ["esift-core/datadog-s3"]
+datadog-gcs = ["esift-core/datadog-gcs"]
+datadog-azure = ["esift-core/datadog-azure"]
 datadog-api = ["esift-core/datadog-api"]
 
 [dependencies]
