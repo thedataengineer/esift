@@ -509,6 +509,52 @@ impl ObjectStore for AzureObjectStore {
     }
 }
 
+/// Register descriptions/units for the archive metrics with the global recorder.
+///
+/// Descriptions route to whatever recorder the CLI installed before `open` runs;
+/// with no recorder (e.g. in unit tests) every `describe_*!` is a no-op. Safe to
+/// call repeatedly — `open_with_store` invokes it once per run.
+#[cfg(any(
+    feature = "datadog-s3",
+    feature = "datadog-gcs",
+    feature = "datadog-azure"
+))]
+fn describe_metrics() {
+    use metrics::Unit;
+    metrics::describe_histogram!(
+        "esift_archive_list_seconds",
+        Unit::Seconds,
+        "Time spent listing archive objects under the prefix"
+    );
+    metrics::describe_counter!(
+        "esift_archive_objects_listed_total",
+        "Archive object keys returned by listing (after filtering)"
+    );
+    metrics::describe_histogram!(
+        "esift_archive_get_seconds",
+        Unit::Seconds,
+        "Time spent downloading a single archive object"
+    );
+    metrics::describe_counter!(
+        "esift_archive_files_total",
+        "Archive objects downloaded and processed"
+    );
+    metrics::describe_counter!(
+        "esift_archive_bytes_total",
+        Unit::Bytes,
+        "Compressed bytes downloaded from archive objects"
+    );
+    metrics::describe_counter!(
+        "esift_archive_decode_errors_total",
+        "Archive JSON lines that failed to parse"
+    );
+    metrics::describe_counter!(
+        "esift_archive_decompressed_bytes_total",
+        Unit::Bytes,
+        "Decompressed bytes produced from archive objects"
+    );
+}
+
 #[cfg(any(
     feature = "datadog-s3",
     feature = "datadog-gcs",
@@ -592,7 +638,16 @@ impl DatadogArchiveSource {
 
     /// List + sort + apply resume, populating `self.state`.
     async fn open_with_store(&mut self, store: &dyn ObjectStore) -> Result<()> {
+        describe_metrics();
+        let cloud = self.cloud.as_str();
+
+        let list_start = std::time::Instant::now();
         let mut keys = store.list(&self.prefix).await?;
+        metrics::histogram!("esift_archive_list_seconds", "cloud" => cloud)
+            .record(list_start.elapsed().as_secs_f64());
+        let listed = keys.len();
+        metrics::counter!("esift_archive_objects_listed_total", "cloud" => cloud)
+            .increment(listed as u64);
         keys.sort();
 
         let (last_key, files_done) = self.decode_resume();
@@ -617,6 +672,16 @@ impl DatadogArchiveSource {
                 }
             });
         }
+
+        let remaining = keys.len();
+        tracing::info!(
+            cloud = %cloud,
+            bucket = %self.bucket,
+            prefix = %self.prefix,
+            listed,
+            remaining,
+            "opened Datadog archive source; listing complete"
+        );
 
         self.state = ArchiveState {
             keys,
@@ -653,7 +718,22 @@ impl DatadogArchiveSource {
             })?,
         };
 
+        let cloud = self.cloud.as_str();
+        let get_start = std::time::Instant::now();
         let raw = store.get(&key).await?;
+        let elapsed = get_start.elapsed();
+        metrics::histogram!("esift_archive_get_seconds", "cloud" => cloud)
+            .record(elapsed.as_secs_f64());
+        let bytes = raw.len();
+        metrics::counter!("esift_archive_files_total", "cloud" => cloud).increment(1);
+        metrics::counter!("esift_archive_bytes_total", "cloud" => cloud).increment(bytes as u64);
+        tracing::debug!(
+            %key,
+            bytes,
+            elapsed_ms = elapsed.as_millis(),
+            "downloaded archive object"
+        );
+
         let decoded = decompress::decompress(&raw, codec)?;
         let text = String::from_utf8(decoded)
             .map_err(|e| EsiftError::Source(format!("archive {key} is not valid UTF-8: {e}")))?;
@@ -663,8 +743,17 @@ impl DatadogArchiveSource {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(line)
-                .map_err(|e| EsiftError::Source(format!("invalid JSON in {key} line {n}: {e}")))?;
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(e) => {
+                    metrics::counter!("esift_archive_decode_errors_total", "cloud" => cloud)
+                        .increment(1);
+                    tracing::warn!(%key, line = n, error = %e, "failed to parse archive JSON line");
+                    return Err(EsiftError::Source(format!(
+                        "invalid JSON in {key} line {n}: {e}"
+                    )));
+                }
+            };
             let body = super::flatten_archive::flatten(value);
             docs.push(Document::new("datadog", format!("{key}#{n}"), body));
         }
@@ -758,6 +847,10 @@ fn feature_error(cloud: CloudProvider) -> EsiftError {
 
 #[async_trait]
 impl Source for DatadogArchiveSource {
+    #[tracing::instrument(
+        skip(self),
+        fields(cloud = %self.cloud.as_str(), bucket = %self.bucket, prefix = %self.prefix)
+    )]
     async fn open(&mut self) -> Result<()> {
         match self.cloud {
             #[cfg(feature = "datadog-s3")]
@@ -1141,6 +1234,102 @@ mod tests {
         assert_eq!(all.len(), 3);
         // The box is returned to the field once the stream is exhausted.
         assert!(src.store.is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics test: drive the pipeline under a local Prometheus recorder and assert
+// the archive counters are actually emitted. Pinned to `datadog-s3` so it runs
+// in the lean feature-gated test job; the metrics macros are no-ops in the other
+// pipeline tests (no global recorder), so those are unaffected.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "datadog-s3"))]
+mod metrics_tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression as GzLevel};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    /// Minimal in-memory store (self-contained so this module doesn't depend on
+    /// the sibling `tests` module's private fixtures).
+    struct FakeStore {
+        objects: BTreeMap<String, Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for FakeStore {
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            Ok(self
+                .objects
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.objects
+                .get(key)
+                .cloned()
+                .ok_or_else(|| EsiftError::Source(format!("no such key {key}")))
+        }
+    }
+
+    fn gzip(ndjson: &str) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), GzLevel::default());
+        enc.write_all(ndjson.as_bytes()).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn pipeline_run_increments_files_total() {
+        // Build a local recorder so the otherwise-no-op `metrics!` macros record
+        // into a handle we can render, without installing a process-global one.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        // `with_local_recorder` sets the recorder for this thread for the
+        // duration of the (synchronous) closure, so run the async pipeline to
+        // completion on a current-thread runtime created inside it.
+        metrics::with_local_recorder(&recorder, || {
+            let mut objects = BTreeMap::new();
+            objects.insert(
+                "dd/2026/06/19/00/00_a.json.gz".to_string(),
+                gzip("{\"host\":\"h1\"}\n"),
+            );
+            objects.insert(
+                "dd/2026/06/19/00/01_b.json.gz".to_string(),
+                gzip("{\"host\":\"h2\"}\n"),
+            );
+            let store = FakeStore { objects };
+            let mut src = DatadogArchiveSource::new(
+                "my-bucket",
+                "dd/2026/06/19/",
+                Some("us-east-1".to_string()),
+                None,
+                None,
+                Compression::Auto,
+                None,
+            )
+            .unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(src.run_with_store(&store))
+                .unwrap();
+        });
+
+        let rendered = handle.render();
+        // Two objects, both downloaded → files_total counter is emitted (==2).
+        assert!(
+            rendered.contains("esift_archive_files_total"),
+            "expected esift_archive_files_total in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cloud=\"s3\""),
+            "expected cloud=\"s3\" label in:\n{rendered}"
+        );
     }
 }
 

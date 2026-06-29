@@ -1150,6 +1150,7 @@ dependencies = [
  "google-cloud-storage",
  "http 1.4.2",
  "metrics",
+ "metrics-exporter-prometheus",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

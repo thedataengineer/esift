@@ -13,15 +13,16 @@
 //! timestamped (`timestamp`) and routed to a stream (`routing`), batched into
 //! one or more payloads (`build`), sent (`transport`) with retry (`http::retry`)
 //! across an optional concurrency window (`pipeline`), and the response is
-//! accounted (`response`) with rejects sent to a dead-letter sink (`deadletter`)
-//! and counted (`metrics`). Each seam ships a behavior-preserving stub that the
-//! corresponding feature lane fleshes out independently.
+//! accounted (`response`) with rejects sent to a dead-letter sink (`deadletter`).
+//! Throughput is reported through the global `metrics` facade so the counters
+//! surface on the binary's Prometheus endpoint alongside everything else. Each
+//! seam ships a behavior-preserving stub that the corresponding feature lane
+//! fleshes out independently.
 
 mod auth;
 mod build;
 pub mod config;
 mod deadletter;
-mod metrics;
 mod pipeline;
 mod response;
 mod routing;
@@ -33,8 +34,16 @@ mod types;
 use super::Destination;
 use crate::{error::Result, Document};
 use async_trait::async_trait;
+use metrics::{counter, describe_counter};
 use std::sync::Arc;
 use tracing::{debug, warn};
+
+/// Counter: documents handed to the sink in a batch.
+const SUBMITTED: &str = "esift_oo_submitted_total";
+/// Counter: documents OpenObserve accepted.
+const ACCEPTED: &str = "esift_oo_accepted_total";
+/// Counter: documents OpenObserve rejected.
+const REJECTED: &str = "esift_oo_rejected_total";
 
 pub use self::config::OpenObserveOptions;
 pub use self::types::RejectedDoc;
@@ -54,7 +63,6 @@ pub(crate) struct SinkContext {
 pub struct OpenObserveDestination {
     ctx: Arc<SinkContext>,
     stream: String,
-    metrics: metrics::Metrics,
 }
 
 impl OpenObserveDestination {
@@ -73,6 +81,10 @@ impl OpenObserveDestination {
         // Stream is set per-document in the action line _index field.
         let bulk_url = format!("{}/api/{}/_bulk", base_url, org);
 
+        describe_counter!(SUBMITTED, "Documents submitted to OpenObserve in a batch");
+        describe_counter!(ACCEPTED, "Documents accepted by OpenObserve");
+        describe_counter!(REJECTED, "Documents rejected by OpenObserve");
+
         Ok(Self {
             ctx: Arc::new(SinkContext {
                 client,
@@ -82,7 +94,6 @@ impl OpenObserveDestination {
                 options,
             }),
             stream: stream.into(),
-            metrics: metrics::Metrics::default(),
         })
     }
 }
@@ -93,7 +104,8 @@ impl Destination for OpenObserveDestination {
         if docs.is_empty() {
             return Ok(0);
         }
-        self.metrics.record_submitted(docs.len());
+        let submitted = docs.len();
+        counter!(SUBMITTED).increment(submitted as u64);
 
         // Stamp and route every document.
         let routed: Vec<RoutedDoc> = docs
@@ -122,13 +134,21 @@ impl Destination for OpenObserveDestination {
         })
         .await?;
 
-        self.metrics.record_outcome(&outcome);
+        let rejected = outcome.rejected.len();
+        record_outcome_metrics(&outcome);
 
-        if !outcome.rejected.is_empty() {
+        debug!(
+            submitted,
+            accepted = outcome.accepted,
+            rejected,
+            "OpenObserve bulk batch complete"
+        );
+
+        if rejected > 0 {
             warn!(
                 "OpenObserve rejected {} of {} documents",
-                outcome.rejected.len(),
-                outcome.accepted + outcome.rejected.len()
+                rejected,
+                outcome.accepted + rejected
             );
             deadletter::write(&self.ctx.options, &outcome.rejected)?;
         }
@@ -154,4 +174,54 @@ async fn send_chunk(ctx: &SinkContext, chunk: BulkChunk) -> Result<BulkOutcome> 
     .await?;
 
     response::parse(resp, &chunk.docs).await
+}
+
+/// Emit the accepted/rejected facade counters for one bulk outcome.
+fn record_outcome_metrics(outcome: &BulkOutcome) {
+    counter!(ACCEPTED).increment(outcome.accepted as u64);
+    counter!(REJECTED).increment(outcome.rejected.len() as u64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// A representative outcome flowing through the sink emits the submitted,
+    /// accepted, and rejected facade counters so they surface on the Prometheus
+    /// endpoint the binary installs.
+    #[test]
+    fn outcome_increments_facade_counters() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            // `submitted` is emitted up front in `write_batch`; the accepted and
+            // rejected counters come from the real outcome-recording path.
+            counter!(SUBMITTED).increment(5);
+            let outcome = BulkOutcome {
+                accepted: 4,
+                rejected: vec![RejectedDoc {
+                    stream: "logs".to_string(),
+                    reason: "schema mismatch".to_string(),
+                    body: serde_json::json!({ "k": "v" }),
+                }],
+            };
+            record_outcome_metrics(&outcome);
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("esift_oo_submitted_total 5"),
+            "missing submitted counter in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("esift_oo_accepted_total 4"),
+            "missing accepted counter in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("esift_oo_rejected_total 1"),
+            "missing rejected counter in:\n{rendered}"
+        );
+    }
 }

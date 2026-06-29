@@ -25,7 +25,7 @@ use reqwest::{header, Client};
 #[cfg(feature = "datadog-api")]
 use serde_json::json;
 #[cfg(feature = "datadog-api")]
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Index label attached to every emitted [`Document`]. The Logs Search API has
 /// no per-event index, so a stable constant keeps downstream routing simple.
@@ -35,6 +35,75 @@ const DD_INDEX: &str = "datadog";
 /// Page size requested from the Logs Search API.
 #[cfg(feature = "datadog-api")]
 const PAGE_LIMIT: u64 = 1000;
+
+// --- Metric names -----------------------------------------------------------
+//
+// Conventions: `esift_`-prefixed; counters end `_total`; duration histograms end
+// `_seconds`. Labels are kept low-cardinality (never the query, cursor, or
+// window bounds — those live in tracing fields).
+
+/// Count of HTTP requests issued to the Logs Search API (one per attempt,
+/// including 429 retries). Labelled `result` = `ok` | `error`.
+#[cfg(feature = "datadog-api")]
+const M_REQUESTS_TOTAL: &str = "esift_datadog_api_requests_total";
+/// Wall-clock duration of each Logs Search request/response round-trip
+/// (seconds). Labelled `result` = `ok` | `error`.
+#[cfg(feature = "datadog-api")]
+const M_REQUEST_SECONDS: &str = "esift_datadog_api_request_seconds";
+/// Count of pages fetched (successful responses) from the Logs Search API.
+#[cfg(feature = "datadog-api")]
+const M_PAGES_TOTAL: &str = "esift_datadog_api_pages_total";
+/// Count of documents emitted, incremented by each batch's size.
+#[cfg(feature = "datadog-api")]
+const M_DOCS_TOTAL: &str = "esift_datadog_api_docs_total";
+/// Count of time-windows fully drained.
+#[cfg(feature = "datadog-api")]
+const M_WINDOWS_TOTAL: &str = "esift_datadog_api_windows_total";
+/// Count of HTTP 429 rate-limit responses encountered.
+#[cfg(feature = "datadog-api")]
+const M_RATE_LIMITED_TOTAL: &str = "esift_datadog_rate_limited_total";
+/// Duration slept honouring a rate-limit backoff (seconds).
+#[cfg(feature = "datadog-api")]
+const M_RATE_LIMIT_WAIT_SECONDS: &str = "esift_datadog_rate_limit_wait_seconds";
+
+/// Register descriptions/units for every metric this source emits. Idempotent
+/// and cheap; called once from [`DatadogApiSource::open`]. Without a global
+/// recorder installed (e.g. unit tests) these calls are no-ops.
+#[cfg(feature = "datadog-api")]
+fn describe_metrics() {
+    use metrics::{describe_counter, describe_histogram, Unit};
+
+    describe_counter!(
+        M_REQUESTS_TOTAL,
+        "Total HTTP requests to the Datadog Logs Search API (per attempt, including 429 retries)"
+    );
+    describe_histogram!(
+        M_REQUEST_SECONDS,
+        Unit::Seconds,
+        "Latency of each Datadog Logs Search API request/response"
+    );
+    describe_counter!(
+        M_PAGES_TOTAL,
+        "Total paginated pages fetched from the Datadog Logs Search API"
+    );
+    describe_counter!(
+        M_DOCS_TOTAL,
+        "Total documents emitted from the Datadog Logs Search API"
+    );
+    describe_counter!(
+        M_WINDOWS_TOTAL,
+        "Total time-windows fully drained by the Datadog Logs Search API source"
+    );
+    describe_counter!(
+        M_RATE_LIMITED_TOTAL,
+        "Total HTTP 429 rate-limit responses from the Datadog Logs Search API"
+    );
+    describe_histogram!(
+        M_RATE_LIMIT_WAIT_SECONDS,
+        Unit::Seconds,
+        "Duration slept honouring a Datadog Logs Search API rate-limit backoff"
+    );
+}
 
 // Without the feature, only `site` is read (by the fallback `Source` impl); the
 // remaining fields exist so the constructor signature is stable across builds.
@@ -394,20 +463,47 @@ impl DatadogApiSource {
         let body = self.search_body(window);
 
         loop {
-            let resp = client.post(&url).json(&body).send().await?;
+            // Time the full request/response round-trip so the histogram captures
+            // network + server latency for each attempt.
+            let started = std::time::Instant::now();
+            let send_result = client.post(&url).json(&body).send().await;
+            let resp = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    metrics::counter!(M_REQUESTS_TOTAL, "result" => "error").increment(1);
+                    metrics::histogram!(M_REQUEST_SECONDS, "result" => "error").record(elapsed);
+                    return Err(EsiftError::from(e));
+                }
+            };
+            let elapsed = started.elapsed().as_secs_f64();
             let status = resp.status();
 
             if status.as_u16() == 429 {
+                // 429 counts as a (failed) request attempt for rate-tracking.
+                metrics::counter!(M_REQUESTS_TOTAL, "result" => "error").increment(1);
+                metrics::histogram!(M_REQUEST_SECONDS, "result" => "error").record(elapsed);
+
+                let reset = resp
+                    .headers()
+                    .get("X-RateLimit-Reset")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
                 let wait = rate_limit_wait(resp.headers());
+                metrics::counter!(M_RATE_LIMITED_TOTAL).increment(1);
+                metrics::histogram!(M_RATE_LIMIT_WAIT_SECONDS).record(wait.as_secs_f64());
                 warn!(
-                    "Datadog API 429 rate-limited; sleeping {}ms before retry",
-                    wait.as_millis()
+                    reset = reset.as_deref().unwrap_or("<absent>"),
+                    wait_ms = wait.as_millis() as u64,
+                    "Datadog API 429 rate-limited; sleeping toward X-RateLimit-Reset before retry"
                 );
                 tokio::time::sleep(wait).await;
                 continue;
             }
 
             if !status.is_success() {
+                metrics::counter!(M_REQUESTS_TOTAL, "result" => "error").increment(1);
+                metrics::histogram!(M_REQUEST_SECONDS, "result" => "error").record(elapsed);
                 let text = resp
                     .text()
                     .await
@@ -417,6 +513,8 @@ impl DatadogApiSource {
                 )));
             }
 
+            metrics::counter!(M_REQUESTS_TOTAL, "result" => "ok").increment(1);
+            metrics::histogram!(M_REQUEST_SECONDS, "result" => "ok").record(elapsed);
             return resp.json::<Value>().await.map_err(EsiftError::from);
         }
     }
@@ -424,6 +522,8 @@ impl DatadogApiSource {
     /// Advance to the next window: pop the live one, reset the in-window cursor.
     /// Marks the run exhausted once no windows remain.
     fn advance_window(&mut self) {
+        // Bounds of the window being drained, for the completion log.
+        let drained = self.windows.front().cloned();
         self.windows_done += 1;
         self.after = None;
         self.windows.pop_front();
@@ -431,6 +531,20 @@ impl DatadogApiSource {
         if self.current.is_none() {
             self.exhausted = true;
         }
+        metrics::counter!(M_WINDOWS_TOTAL).increment(1);
+        info!(
+            win_from = drained
+                .as_ref()
+                .and_then(|w| w.from.as_deref())
+                .unwrap_or("<none>"),
+            win_to = drained
+                .as_ref()
+                .and_then(|w| w.to.as_deref())
+                .unwrap_or("<none>"),
+            windows_done = self.windows_done,
+            remaining = self.windows.len(),
+            "Datadog API window drained"
+        );
     }
 }
 
@@ -470,7 +584,21 @@ fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> std::time::Duration 
 #[cfg(feature = "datadog-api")]
 #[async_trait]
 impl Source for DatadogApiSource {
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            site = %self.site,
+            query = %self.query,
+            from = self.from.as_deref().unwrap_or("<none>"),
+            to = self.to.as_deref().unwrap_or("<none>"),
+            window_minutes = self.window_minutes,
+        )
+    )]
     async fn open(&mut self) -> Result<()> {
+        // Register metric descriptions once per source open. No-op without a
+        // global recorder (e.g. unit tests).
+        describe_metrics();
+
         // Validate site even when a test override is set, so a bad config is
         // still caught.
         let resolved = super::site::base_url(&self.site)?;
@@ -512,11 +640,19 @@ impl Source for DatadogApiSource {
             self.exhausted = true;
         }
         self.windows = windows;
-        debug!(
-            "Datadog API source open: {} window(s), site={}",
-            self.windows.len(),
-            self.site
+        info!(
+            windows_queued = self.windows.len(),
+            windows_done = self.windows_done,
+            "Datadog API source opened"
         );
+        if let Some(win) = self.current.as_ref() {
+            info!(
+                win_from = win.from.as_deref().unwrap_or("<none>"),
+                win_to = win.to.as_deref().unwrap_or("<none>"),
+                resuming = self.after.is_some(),
+                "Datadog API window open"
+            );
+        }
         Ok(())
     }
 
@@ -567,6 +703,21 @@ impl Source for DatadogApiSource {
                 })
                 .collect();
 
+            // One page fetched; record it and (by count) the documents it
+            // carried. A non-empty page is always returned immediately, so
+            // incrementing by `docs.len()` here counts every emitted document
+            // exactly once (empty pages add zero).
+            let doc_count = docs.len();
+            metrics::counter!(M_PAGES_TOTAL).increment(1);
+            metrics::counter!(M_DOCS_TOTAL).increment(doc_count as u64);
+            debug!(
+                docs = doc_count,
+                has_after = next_after.is_some(),
+                win_from = window.from.as_deref().unwrap_or("<none>"),
+                win_to = window.to.as_deref().unwrap_or("<none>"),
+                "Datadog API page fetched"
+            );
+
             match next_after {
                 Some(after) => {
                     self.after = Some(after);
@@ -587,7 +738,6 @@ impl Source for DatadogApiSource {
                 continue;
             }
 
-            debug!("Datadog API fetched {} document(s)", docs.len());
             return Ok(Some(docs));
         }
     }
@@ -848,5 +998,99 @@ mod tests {
         assert!(src.next_batch().await.unwrap().is_none());
 
         src.close().await.unwrap();
+    }
+
+    /// With a local Prometheus recorder installed, draining a mocked single
+    /// window records the emitted documents in `esift_datadog_api_docs_total`.
+    /// Mirrors the wiremock setup of `two_page_pagination_single_window` but
+    /// runs the drain inside `metrics::with_local_recorder` (which takes a sync
+    /// closure, so the async work is driven via `block_on`).
+    #[test]
+    fn docs_total_counter_increments() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Stand up the mock server (single window, three docs across two pages)
+        // outside the recorder scope.
+        let server = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/logs/events/search"))
+                .and(body_partial_json(json!({ "page": { "limit": 1000 } })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [
+                        { "id": "m1", "type": "log", "attributes": { "message": "one" } },
+                        { "id": "m2", "type": "log", "attributes": { "message": "two" } }
+                    ],
+                    "meta": { "page": { "after": "CUR1" } }
+                })))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/logs/events/search"))
+                .and(body_partial_json(json!({ "page": { "cursor": "CUR1" } })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [
+                        { "id": "m3", "type": "log", "attributes": { "message": "three" } }
+                    ],
+                    "meta": { "page": { "after": null } }
+                })))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            server
+        });
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let total = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let mut src = DatadogApiSource::new(
+                    "datadoghq.com",
+                    "key",
+                    "app",
+                    "service:web",
+                    Some("2025-01-01T00:00:00Z".into()),
+                    Some("2025-01-01T00:30:00Z".into()),
+                    60,
+                    None,
+                )
+                .unwrap()
+                .with_base_url(server.uri());
+
+                src.open().await.unwrap();
+                let mut count = 0usize;
+                while let Some(batch) = src.next_batch().await.unwrap() {
+                    count += batch.len();
+                }
+                src.close().await.unwrap();
+                count
+            })
+        });
+
+        // Three documents flowed through the batches...
+        assert_eq!(total, 3);
+
+        // ...and the Prometheus scrape reflects the docs counter at 3.
+        let rendered = handle.render();
+        let docs_line = rendered
+            .lines()
+            .find(|l| l.starts_with("esift_datadog_api_docs_total"))
+            .unwrap_or_else(|| {
+                panic!("esift_datadog_api_docs_total missing from scrape:\n{rendered}")
+            });
+        let value: f64 = docs_line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse docs_total from line: {docs_line}"));
+        assert_eq!(value, 3.0, "full scrape:\n{rendered}");
     }
 }

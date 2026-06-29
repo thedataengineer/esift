@@ -35,29 +35,39 @@ impl Codec {
 
 /// Decompress `bytes` with `codec`, returning the decoded payload.
 pub fn decompress(bytes: &[u8], codec: Codec) -> Result<Vec<u8>> {
-    match codec {
+    let out = match codec {
         Codec::Gzip => {
             let mut out = Vec::new();
             flate2::read::GzDecoder::new(bytes)
                 .read_to_end(&mut out)
                 .map_err(|e| EsiftError::Source(format!("gzip decode failed: {e}")))?;
-            Ok(out)
+            out
         }
         Codec::Zstd => {
             #[cfg(feature = "datadog-s3")]
             {
                 zstd::stream::decode_all(bytes)
-                    .map_err(|e| EsiftError::Source(format!("zstd decode failed: {e}")))
+                    .map_err(|e| EsiftError::Source(format!("zstd decode failed: {e}")))?
             }
             #[cfg(not(feature = "datadog-s3"))]
             {
                 let _ = bytes;
-                Err(EsiftError::Source(
+                return Err(EsiftError::Source(
                     "zstd decompression requires building with --features datadog-s3".into(),
-                ))
+                ));
             }
         }
-    }
+    };
+    // No cloud label in scope here (the codec/sizes are all we know); the archive
+    // source records the cloud-labelled byte/duration metrics around this call.
+    tracing::debug!(
+        codec = ?codec,
+        input_bytes = bytes.len(),
+        output_bytes = out.len(),
+        "decompressed archive object"
+    );
+    metrics::counter!("esift_archive_decompressed_bytes_total").increment(out.len() as u64);
+    Ok(out)
 }
 
 #[cfg(test)]
