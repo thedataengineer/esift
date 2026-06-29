@@ -66,7 +66,6 @@ pub fn decompress(bytes: &[u8], codec: Codec) -> Result<Vec<u8>> {
         output_bytes = out.len(),
         "decompressed archive object"
     );
-    metrics::counter!("esift_archive_decompressed_bytes_total").increment(out.len() as u64);
     Ok(out)
 }
 

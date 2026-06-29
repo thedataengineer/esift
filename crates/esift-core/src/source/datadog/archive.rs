@@ -735,6 +735,8 @@ impl DatadogArchiveSource {
         );
 
         let decoded = decompress::decompress(&raw, codec)?;
+        metrics::counter!("esift_archive_decompressed_bytes_total", "cloud" => cloud)
+            .increment(decoded.len() as u64);
         let text = String::from_utf8(decoded)
             .map_err(|e| EsiftError::Source(format!("archive {key} is not valid UTF-8: {e}")))?;
 
