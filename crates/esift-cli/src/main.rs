@@ -19,10 +19,8 @@ use esift_core::{
 use esift_transform::mapping::Transformer;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::{error, info};
 
-mod metrics;
 mod metrics_server;
 mod secret;
 
@@ -304,14 +302,13 @@ async fn main() -> Result<()> {
             };
 
             let transformer = Transformer::identity();
-            let metrics = start_metrics(metrics_addr);
+            install_metrics(metrics_addr);
 
             run_extraction(
                 &mut *source,
                 &mut *destination,
                 &transformer,
                 &mut checkpoint_mgr,
-                &metrics,
             )
             .await?;
         }
@@ -351,14 +348,13 @@ async fn run_from_config(cfg: EsiftConfig) -> Result<()> {
     };
 
     let transformer = Transformer::new(cfg.transforms);
-    let metrics = start_metrics(cfg.metrics_addr);
+    install_metrics(cfg.metrics_addr);
 
     run_extraction(
         &mut *source,
         &mut *destination,
         &transformer,
         &mut checkpoint_mgr,
-        &metrics,
     )
     .await
 }
@@ -464,17 +460,38 @@ async fn build_source(
 
 /// Build the shared metrics handle and, when an address is set, start the
 /// metrics endpoint in the background.
-fn start_metrics(addr: Option<String>) -> metrics::SharedMetrics {
-    let handle: metrics::SharedMetrics = Arc::new(metrics::Metrics::default());
+/// Install the global Prometheus recorder so the `metrics::*` macros record,
+/// and — when `addr` is set — spawn the HTTP endpoint that renders them.
+fn install_metrics(addr: Option<String>) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    if metrics::set_global_recorder(recorder).is_err() {
+        tracing::warn!("metrics recorder already installed; skipping");
+        return;
+    }
+    describe_metrics();
     if let Some(addr) = addr {
-        let m = handle.clone();
         tokio::spawn(async move {
-            if let Err(e) = metrics_server::serve(addr, m).await {
+            if let Err(e) = metrics_server::serve(addr, handle).await {
                 error!("metrics server error: {e}");
             }
         });
     }
-    handle
+}
+
+/// One-time HELP descriptions for the core extraction metrics. Component
+/// metrics (Datadog sources, destinations) describe themselves at their call
+/// sites.
+fn describe_metrics() {
+    metrics::describe_counter!(
+        "esift_docs_written_total",
+        "Total documents written to the destination."
+    );
+    metrics::describe_counter!(
+        "esift_batches_total",
+        "Total batches written to the destination."
+    );
+    metrics::describe_counter!("esift_errors_total", "Total source or destination errors.");
 }
 
 async fn run_extraction(
@@ -482,7 +499,6 @@ async fn run_extraction(
     dest: &mut dyn Destination,
     transformer: &Transformer,
     checkpoint: &mut CheckpointManager,
-    metrics: &metrics::SharedMetrics,
 ) -> Result<()> {
     info!("Source:      {}", source.description());
     info!("Destination: {}", dest.description());
@@ -508,12 +524,13 @@ async fn run_extraction(
                         checkpoint.state.record_batch(written, source.cursor());
                         checkpoint.save()?;
                         total += written as u64;
-                        metrics.record_batch(written as u64);
+                        metrics::counter!("esift_docs_written_total").increment(written as u64);
+                        metrics::counter!("esift_batches_total").increment(1);
                         progress.set_message(format!("{} documents extracted", total));
                     }
                     Err(e) => {
                         error!("Write failed: {}", e);
-                        metrics.record_error();
+                        metrics::counter!("esift_errors_total").increment(1);
                         source.close().await?;
                         return Err(e.into());
                     }
@@ -525,7 +542,7 @@ async fn run_extraction(
             }
             Err(e) => {
                 error!("Source error: {}", e);
-                metrics.record_error();
+                metrics::counter!("esift_errors_total").increment(1);
                 source.close().await?;
                 return Err(e.into());
             }
