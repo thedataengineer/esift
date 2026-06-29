@@ -30,6 +30,8 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 indicatif.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 esift-core.workspace = true
 esift-transform.workspace = true
 

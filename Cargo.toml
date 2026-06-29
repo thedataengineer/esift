@@ -33,6 +33,8 @@ url = { version = "2.5", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
 indicatif = "0.17"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 esift-core = { path = "crates/esift-core" }
 esift-transform = { path = "crates/esift-transform" }
 aws-config = { version = "1.1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
